@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use remo_broker::audit::{AuditWriter, WriterShutdown};
 use remo_broker::bootstrap::fetch_token;
 use remo_broker::config::{BootstrapSource, BootstrapSourceKind, Config, Overrides};
+use remo_broker::server::Server;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,13 +105,28 @@ async fn main() -> anyhow::Result<()> {
         anyhow::Error::new(e).context("bootstrap source did not yield a usable token")
     })?;
 
+    let (audit, audit_handle) = AuditWriter::spawn(config.audit_log_path.clone());
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         socket_dir = %config.socket_dir.display(),
         audit_log_path = %config.audit_log_path.display(),
         cache_default_ttl_secs = config.cache_default_ttl.as_secs(),
         bootstrap_ok = true,
-        "remo-broker starting (skeleton — sockets not yet wired)"
+        "remo-broker starting"
+    );
+
+    Server::new(config, audit).run().await?;
+
+    // Wait for the audit writer to drain after Server::run dropped its handle.
+    let WriterShutdown {
+        events_written,
+        degraded_buffer_remaining,
+    } = audit_handle.await.unwrap_or_default();
+    tracing::info!(
+        events_written,
+        degraded_buffer_remaining,
+        "audit writer exited"
     );
 
     Ok(())
