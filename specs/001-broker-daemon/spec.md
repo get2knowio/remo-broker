@@ -3,7 +3,7 @@
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
 **Status**: In Progress
-**Last Updated**: 2026-05-24 (commit `7f3ae01`)
+**Last Updated**: 2026-05-24 (commit `7ef64d9`)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
 
 ## Implementation Status
@@ -22,24 +22,24 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | FR-004 | Pending | `fnox-core` dependency not yet added; broker has no backend retrieval code. |
 | FR-005 | Pending | Depends on FR-004. |
 | FR-006 | Done | `src/server.rs::ensure_socket_dir` + `bind_admin_socket` create `socket_dir` (0755) and `admin.sock` (0600). |
-| FR-007 | Pending | Per-project socket creation lives in the admin `register` handler, which is currently a stub. |
-| FR-008 | Partial | Admin socket removed on shutdown in `Server::run`; project sockets not yet created so nothing to clean up there. |
-| FR-009 | Done | `bind_admin_socket` removes a stale `admin.sock` before binding; `stale_admin_socket_is_replaced_on_bind` test covers this. |
-| FR-010 | Done | `src/manifest.rs` parses + validates per `docs/manifest-schema.md`; 21 unit tests for the validation rules. |
-| FR-011 | Pending | Needs the project registry. |
-| FR-012 | Pending | No fetch path yet. |
+| FR-007 | Done | `src/registry.rs::bind_project_socket` binds `<socket_dir>/<name>.sock` (mode 0660) on admin `register`. Group-ownership configuration still TBD with the systemd unit (FR-023). |
+| FR-008 | Done | Admin socket removed on shutdown; project sockets removed on `unregister` and again on shutdown after their accept loops drain. |
+| FR-009 | Done | `bind_admin_socket` + `bind_project_socket` both remove stale files before binding; covered by `stale_admin_socket_is_replaced_on_bind` and `register_replaces_stale_socket_file`. |
+| FR-010 | Done | `src/manifest.rs` parses + validates per `docs/manifest-schema.md`; `dispatch_register` invokes `Manifest::load` before binding, surfacing `manifest_invalid` / `manifest_not_found` on failure. |
+| FR-011 | Done | `Project.manifest` is `ArcSwap<Manifest>`; `reload` swaps atomically. `reload_propagates_new_allowlist` confirms in-flight project-socket connections see the new allowlist on the next op without a teardown. |
+| FR-012 | Done | `dispatch_project` checks the project's `ArcSwap` allowlist before doing any backend work; off-allowlist returns `denied` with no backend hit. The actual backend fetch still stubs `backend_error` pending fnox-core. |
 | FR-013 | Pending | Audit writer ready in `src/audit.rs`; emission on each fetch attempt lands with the fetch path. |
 | FR-014 | Pending | No cache implementation yet. |
 | FR-015 | Pending | Will be covered by the absence of disk persistence in the cache implementation. |
 | FR-016 | Pending | `secrecy::SecretString` is the placeholder; swap to fnox-core's `SecretBox` when FR-004 lands. |
 | FR-017 | Partial | Event types + async writer + degraded-mode buffer done in `src/audit.rs`; per-fetch emission pending FR-013. |
 | FR-018 | Done | Bounded channel + in-memory degraded buffer; tests confirm a wedged file write does not block producers. |
-| FR-019 | Partial | All wire types complete in `src/proto/`; admin `status` handles end-to-end; project socket and remaining admin ops still pending. |
-| FR-020 | Partial | Admin `status` advertises both versions; project-socket `ping` not yet implemented. |
+| FR-019 | Partial | All wire types complete in `src/proto/`; admin `register`/`unregister`/`reload`/`status` and project `ping`/`info` handle end-to-end. `get` returns `backend_error` (allowlist denial returns `denied`); `rotate-bootstrap` still stubs `internal_error`. |
+| FR-020 | Done | Admin `status` and project `ping` both advertise `broker_version` + `protocol_version`. |
 | FR-021 | Done | `sd_notify_ready()` is called after the admin socket binds; no-op outside systemd. |
 | FR-022 | Done | `install_sigterm` (SIGTERM + SIGINT) + `SHUTDOWN_DRAIN = 5s` + `drain_join_set`. |
 | FR-023 | Pending | No systemd unit file shipped yet. |
-| FR-024 | Done | `JoinSet` spawns one task per admin connection — no global lock. Same pattern will extend to project sockets. |
+| FR-024 | Done | `JoinSet` spawns one task per admin connection and one task per project-socket connection — no global lock anywhere on the data plane. |
 
 ### Non-functional requirements
 
@@ -61,7 +61,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | SC-002 | Pending | No soak harness yet. |
 | SC-003 | Pending | No killtest harness yet. |
 | SC-004 | Partial | Structural guarantee in `src/audit.rs` (event types cannot carry values; `fetch_event_does_not_serialize_a_value_field` test pins it). Full integration grep pending the end-to-end harness. |
-| SC-005 | Pending | No red-team harness; depends on FR-007/012. |
+| SC-005 | Pending | No red-team harness yet. FR-007/012 are now in place (allowlist denial is wired and reaches no backend), so the harness can be built; the brute-force-name and cross-project escalation cases are the remaining gaps. |
 | SC-006 | Pending | Cross-repo CI depends on the Remo Python codebase and fnox-core landing. |
 
 ### External Dependencies
@@ -91,7 +91,12 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 | `BootstrapSourceKind` (Copy enum for serde/clap) split from `BootstrapSource` (validated, carries per-variant data). | Two distinct concerns: discriminator for parse, full structure for runtime. | `src/config.rs` |
 | `AuditWriter` uses bounded mpsc(1000) + in-memory degraded `VecDeque`(1000), drop-oldest FIFO when full. | FR-018: producers never block. The degraded buffer matches the spec's "last 1000 events" wording. | `src/audit.rs` |
 | `AuditEvent` is tagged on a top-level `event` field, including `"fetch"`. | Spec hinted at the discriminator with `"manifest.invalid"` / `"socket.recovered"`; making it uniform across all variants simplifies downstream log filtering. | `src/audit.rs` |
-| Per-connection `JoinSet` task spawn for admin handlers; no global lock. | FR-024 pattern. Same approach extends to project sockets when they land. | `src/server.rs` |
+| Per-connection `JoinSet` task spawn for admin handlers and project handlers; no global lock. | FR-024 pattern, applied on both planes. | `src/server.rs` |
+| `Project.manifest` is `ArcSwap<Manifest>`; `reload` stores a fresh `Arc<Manifest>`. | FR-011 atomic swap with zero coordination cost on the read side; each project-socket op loads once at the start of the op and uses a consistent snapshot. | `src/registry.rs` |
+| Project-socket accept loop pins the per-iteration `Notify::notified()` future and calls `enable()` before `select!`. | Closes a real race: `notify_waiters()` racing with the *start* of an iteration would otherwise be lost (notify stores no permit), causing the loop to hang on `unregister` / shutdown. | `src/server.rs::run_project_socket` |
+| Per-task abort on global drain timeout (`drain_project_loops`). | A leaked `Arc<Server>` would keep an `AuditWriter` sender alive, which would block `audit_handle.await` in main and hang the daemon on shutdown. Abort releases the Arc. | `src/server.rs::drain_project_loops` |
+| `register` validates the manifest **before** taking the registry write lock. | Slow disk reads (NFS, encrypted credentials volume, etc.) don't stall concurrent `unregister`/`reload` for other projects. | `src/registry.rs::register` |
+| `unregister` cap is the same `SHUTDOWN_DRAIN` (5 s) as global shutdown. | Wedged connections on one project must not pin the admin loop; symmetry with global shutdown keeps the rule easy to reason about. | `src/server.rs::dispatch_unregister` |
 | Drain on SIGTERM **and** SIGINT. | Ctrl-C during dev produces the same clean shutdown systemd would. | `src/server.rs::install_sigterm` |
 | Tests use hand-rolled RAII tempdir helpers; no `tempfile` crate dependency. | Helpers are ~15 LoC per module; avoids pulling in a transitive dep just for tests. | every `mod tests` |
 | Tests that mutate env use unique per-test variable names. | `std::env::set_var` is `unsafe` in edition 2024; unique names avoid cross-test races without serializing. | `src/bootstrap.rs::tests` |
@@ -101,19 +106,19 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 
 Items the spec calls for that we've consciously postponed, in roughly the order we plan to tackle them. This list is exhaustive against the requirements above — anything not yet "Done" appears here.
 
-1. **Project registry + admin op handlers** (FR-007 setup, FR-010 wiring, FR-011, FR-019 admin rest). Implement `register` / `unregister` / `reload` handlers backed by a `RwLock<HashMap<String, Project>>`. Per-project state, manifest discovery wiring. Currently the four non-`status` admin handlers are stubs returning `internal_error`.
-2. **Project socket binding + connection loop + `ping`/`info` handlers** (FR-007 sockets, FR-008 project-socket cleanup, FR-012 allowlist check, FR-019 project plane, FR-020 project `ping`). Same NDJSON pattern as the admin socket. The `get` op returns `backend_error` until fnox-core lands.
-3. **In-memory cache** (FR-014, FR-015, FR-016 with `secrecy` placeholder). `BoundedCache<SecretName, CacheEntry>`, TTL eviction, zeroize on drop / eviction / `unregister`.
-4. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox`; wire up the actual backend fetch.
-5. **Per-fetch audit emission** (FR-013, the emission half of FR-017). Connect the fetch path into the existing `AuditWriter`.
-6. **IMDSv2 bootstrap source** (FR-002b). Small HTTP client against `169.254.169.254`; mocked metadata endpoint in tests.
-7. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core.
-8. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`.
-9. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
-10. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
-11. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
-12. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket auth code can land in its final form.
-13. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+1. **In-memory cache** (FR-014, FR-015, FR-016 with `secrecy` placeholder). `BoundedCache<SecretName, CacheEntry>`, TTL eviction, zeroize on drop / eviction / `unregister`. The cache attaches to `Project` and is the next thing the `get` path needs.
+2. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox`; wire up the actual backend fetch in `dispatch_project::Get` where `backend_error` is currently stubbed.
+3. **Per-fetch audit emission** (FR-013, the emission half of FR-017). Connect the fetch path (allow/deny + cache-hit/backend-hit outcome) into the existing `AuditWriter`. SO_PEERCRED lookups for peer_pid / peer_uid land here too.
+4. **IMDSv2 bootstrap source** (FR-002b). Small HTTP client against `169.254.169.254`; mocked metadata endpoint in tests.
+5. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core. Currently the only admin op still stubbing `internal_error`.
+6. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
+7. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
+8. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
+9. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
+10. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted.
+11. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+
+**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020). These landed in commit `7ef64d9`.
 
 ## Background and Motivation
 
