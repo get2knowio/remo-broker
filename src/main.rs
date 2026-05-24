@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use remo_broker::bootstrap::fetch_token;
 use remo_broker::config::{BootstrapSource, BootstrapSourceKind, Config, Overrides};
 
 #[derive(Debug, Parser)]
@@ -94,11 +95,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // FR-003: refuse to start if no bootstrap source yields a usable token.
+    // We deliberately discard the token after this validation — the daemon
+    // proper will re-fetch when it constructs the fnox-core session.
+    let _token = fetch_token(&config.bootstrap).await.map_err(|e| {
+        eprintln!("error: bootstrap token unavailable: {e}");
+        anyhow::Error::new(e).context("bootstrap source did not yield a usable token")
+    })?;
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         socket_dir = %config.socket_dir.display(),
         audit_log_path = %config.audit_log_path.display(),
         cache_default_ttl_secs = config.cache_default_ttl.as_secs(),
+        bootstrap_ok = true,
         "remo-broker starting (skeleton — sockets not yet wired)"
     );
 
