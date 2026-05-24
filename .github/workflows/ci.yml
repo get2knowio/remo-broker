@@ -78,3 +78,20 @@ jobs:
       # real unit-syntax issues.
       - run: sudo install -m 0755 /bin/true /usr/bin/remo-broker
       - run: systemd-analyze verify packaging/systemd/remo-broker.service
+
+  nfr:
+    name: NFR measurements
+    runs-on: ubuntu-latest
+    # Measures NFR-003 (startup ≤500ms), NFR-004 (idle RSS ≤30MB), and
+    # NFR-005 (binary size ≤15MB) against the release build. NFR-003 +
+    # NFR-004 hard-fail; NFR-005 is currently informational because the
+    # fnox-core dep chain (AWS SDK + ctap-hid-fido2 + transitives) puts
+    # the binary at ~32MiB. Track NFR-005 follow-up in the spec.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev socat
+      - run: cargo build --release
+      - name: Measure
+        run: bash ci/measure_nfr.sh
