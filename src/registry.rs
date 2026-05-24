@@ -13,11 +13,13 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, RwLock};
 
+use crate::cache::BoundedCache;
 use crate::manifest::{Manifest, ManifestError};
 
 const PROJECT_SOCKET_MODE: u32 = 0o660;
@@ -55,7 +57,7 @@ pub enum RegistryError {
 
 /// A registered project. Cloned (via `Arc<Project>`) into the project's
 /// accept loop and connection handlers; mutation goes through `manifest`'s
-/// `ArcSwap` (atomic) and `stop` (notify).
+/// `ArcSwap` (atomic), `cache`'s internal mutex, and `stop` (notify).
 #[derive(Debug)]
 pub struct Project {
     pub name: String,
@@ -63,6 +65,9 @@ pub struct Project {
     pub socket_path: PathBuf,
     pub manifest_path: PathBuf,
     manifest: ArcSwap<Manifest>,
+    /// Per-project in-memory secret cache (FR-014/015/016). Dropped — and
+    /// therefore zeroized — when the project is unregistered.
+    pub cache: BoundedCache,
     /// Notified by the registry/server to ask the project's accept loop to
     /// stop (on `unregister` or daemon shutdown). The accept loop selects on
     /// this and drains its in-flight connections before exiting.
@@ -76,15 +81,25 @@ impl Project {
     }
 }
 
+/// Daemon-wide defaults for cache bounds; per-project overrides land in
+/// the manifest's `[cache]` block.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheDefaults {
+    pub max_entries: u32,
+    pub ttl: Duration,
+}
+
 pub struct ProjectRegistry {
     socket_dir: PathBuf,
+    cache_defaults: CacheDefaults,
     inner: RwLock<HashMap<String, Arc<Project>>>,
 }
 
 impl ProjectRegistry {
-    pub fn new(socket_dir: PathBuf) -> Self {
+    pub fn new(socket_dir: PathBuf, cache_defaults: CacheDefaults) -> Self {
         Self {
             socket_dir,
+            cache_defaults,
             inner: RwLock::new(HashMap::new()),
         }
     }
@@ -119,12 +134,14 @@ impl ProjectRegistry {
             return Err(RegistryError::ProjectExists(name.to_string()));
         }
         let listener = bind_project_socket(&socket_path)?;
+        let (cache_max, cache_ttl) = resolve_cache_bounds(&manifest, self.cache_defaults);
         let project = Arc::new(Project {
             name: name.to_string(),
             project_path: project_path.to_path_buf(),
             socket_path: socket_path.clone(),
             manifest_path,
             manifest: ArcSwap::from_pointee(manifest),
+            cache: BoundedCache::new(cache_max, cache_ttl),
             stop: Notify::new(),
         });
         guard.insert(name.to_string(), project.clone());
@@ -144,7 +161,10 @@ impl ProjectRegistry {
 
     /// Re-read the manifest from disk and atomically swap it in. FR-011
     /// guarantees no fetch sees a partial allowlist: `ArcSwap::store` is the
-    /// single observable point of transition.
+    /// single observable point of transition. Cache bounds from the new
+    /// `[cache]` block are pushed into the existing `BoundedCache` so future
+    /// inserts pick them up; current entries keep their original TTL until
+    /// they expire or are evicted (matches `BoundedCache::set_config`).
     pub async fn reload(&self, name: &str) -> Result<Arc<Manifest>, RegistryError> {
         let project = {
             let guard = self.inner.read().await;
@@ -162,6 +182,8 @@ impl ProjectRegistry {
                 },
             ));
         }
+        let (cache_max, cache_ttl) = resolve_cache_bounds(&new_manifest, self.cache_defaults);
+        project.cache.set_config(cache_max, cache_ttl);
         let arc = Arc::new(new_manifest);
         project.manifest.store(arc.clone());
         Ok(arc)
@@ -172,6 +194,19 @@ impl ProjectRegistry {
     pub async fn snapshot(&self) -> Vec<Arc<Project>> {
         self.inner.read().await.values().cloned().collect()
     }
+}
+
+/// Resolve the (max_entries, ttl) the cache will use for this project.
+/// Manifest values override the daemon-wide defaults; absence means
+/// "inherit from `cache_defaults`".
+fn resolve_cache_bounds(manifest: &Manifest, defaults: CacheDefaults) -> (usize, Duration) {
+    let max = manifest.cache.max_entries.unwrap_or(defaults.max_entries) as usize;
+    let ttl = manifest
+        .cache
+        .ttl_seconds
+        .map(|s| Duration::from_secs(s as u64))
+        .unwrap_or(defaults.ttl);
+    (max, ttl)
 }
 
 fn load_manifest(project_path: &Path) -> Result<(Manifest, PathBuf), RegistryError> {
@@ -241,6 +276,13 @@ mod tests {
         }
     }
 
+    fn defaults() -> CacheDefaults {
+        CacheDefaults {
+            max_entries: 32,
+            ttl: Duration::from_secs(900),
+        }
+    }
+
     /// Build a project directory `<root>/<name>` with a valid manifest under
     /// `.remo/broker.toml`. Returns the project root path.
     fn write_project(root: &Path, name: &str, allowlist: &[&str]) -> PathBuf {
@@ -269,7 +311,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
-        let registry = ProjectRegistry::new(socket_dir.clone());
+        let registry = ProjectRegistry::new(socket_dir.clone(), defaults());
 
         let (project, _listener) = registry.register("alpha", &project_dir).await.unwrap();
         assert_eq!(project.name, "alpha");
@@ -293,7 +335,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let _ = registry.register("alpha", &project_dir).await.unwrap();
         let err = registry.register("alpha", &project_dir).await.unwrap_err();
         assert!(
@@ -308,7 +350,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let err = registry.register("beta", &project_dir).await.unwrap_err();
         assert!(
             matches!(err, RegistryError::ManifestInvalid(_)),
@@ -323,7 +365,7 @@ mod tests {
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = dir.path().join("alpha");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let err = registry.register("alpha", &project_dir).await.unwrap_err();
         assert!(
             matches!(err, RegistryError::ManifestNotFound(_)),
@@ -337,7 +379,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let _ = registry.register("alpha", &project_dir).await.unwrap();
 
         let project = registry.unregister("alpha").await.unwrap();
@@ -355,7 +397,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let (project, _listener) = registry.register("alpha", &project_dir).await.unwrap();
         assert_eq!(
             project.manifest().allowlist.secrets,
@@ -380,7 +422,7 @@ mod tests {
         let dir = tempdir("reload-unknown");
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let err = registry.reload("nope").await.unwrap_err();
         assert!(matches!(err, RegistryError::ProjectUnknown(_)));
     }
@@ -391,7 +433,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
-        let registry = ProjectRegistry::new(socket_dir);
+        let registry = ProjectRegistry::new(socket_dir, defaults());
         let _ = registry.register("alpha", &project_dir).await.unwrap();
 
         // Truncate the manifest to break TOML parse.
@@ -409,7 +451,7 @@ mod tests {
         // Pre-create a stale file where the bind would land.
         std::fs::write(socket_dir.join("alpha.sock"), b"stale").unwrap();
 
-        let registry = ProjectRegistry::new(socket_dir.clone());
+        let registry = ProjectRegistry::new(socket_dir.clone(), defaults());
         let (project, _listener) = registry.register("alpha", &project_dir).await.unwrap();
         let mode = std::fs::metadata(&project.socket_path)
             .unwrap()

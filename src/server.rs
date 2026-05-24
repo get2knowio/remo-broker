@@ -39,7 +39,8 @@ use crate::proto::admin::{
 use crate::proto::project::{
     GetResponse, InfoResponse, PingResponse, ProjectError, ProjectErrorCode, ProjectRequest,
 };
-use crate::registry::{Project, ProjectRegistry, RegistryError};
+use crate::registry::{CacheDefaults, Project, ProjectRegistry, RegistryError};
+use secrecy::ExposeSecret;
 
 /// Max time the daemon waits for in-flight admin connections to finish
 /// after SIGTERM. Beyond this we abort the JoinSet and exit (FR-022).
@@ -93,7 +94,14 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Config, audit: AuditWriter) -> Self {
-        let registry = Arc::new(ProjectRegistry::new(config.socket_dir.clone()));
+        let cache_defaults = CacheDefaults {
+            max_entries: config.cache_default_max_entries,
+            ttl: config.cache_default_ttl,
+        };
+        let registry = Arc::new(ProjectRegistry::new(
+            config.socket_dir.clone(),
+            cache_defaults,
+        ));
         Self {
             config,
             audit,
@@ -101,6 +109,13 @@ impl Server {
             registry,
             project_tasks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Borrowed handle to the project registry. Callers (currently tests +
+    /// future fetch-path wiring) can use this to look up projects without
+    /// going through the admin socket. Cloning the returned `Arc` is cheap.
+    pub fn registry(&self) -> Arc<ProjectRegistry> {
+        Arc::clone(&self.registry)
     }
 
     /// Run until SIGTERM. Returns when the daemon has cleanly shut down.
@@ -383,8 +398,7 @@ async fn dispatch_status(server: &Arc<Server>) -> String {
                 name: p.name.clone(),
                 socket_path: p.socket_path.clone(),
                 allowlist_size: m.allowlist.secrets.len() as u32,
-                // Cache not yet implemented; will be wired with FR-014.
-                cache_entries: 0,
+                cache_entries: p.cache.len() as u32,
             }
         })
         .collect();
@@ -569,7 +583,8 @@ fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) ->
         }
         ProjectRequest::Get { name } => {
             let manifest = project.manifest();
-            // FR-012: allowlist denial does not incur a backend round-trip.
+            // FR-012: allowlist denial does not incur a backend round-trip
+            // and does not consult the cache.
             if !manifest.allowlist.secrets.iter().any(|n| n == &name) {
                 return serde_json::to_string(&ProjectError::new(
                     ProjectErrorCode::Denied,
@@ -577,10 +592,19 @@ fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) ->
                 ))
                 .expect("ProjectError always serializes");
             }
-            // Allowlist passed; backend fetch path (FR-004/FR-005) is not
-            // yet wired. Stub with `backend_error` until fnox-core lands —
-            // exposed shape would be `GetResponse::utf8(value, ttl)`.
-            let _ = GetResponse::utf8("placeholder", 0);
+            // Cache hit short-circuits the backend (FR-014). The plaintext
+            // boundary is here — `expose_secret()` is the one place per
+            // request where the value materialises outside `SecretString`,
+            // and it's immediately handed to `serde_json` to write to the
+            // socket.
+            if let Some(hit) = project.cache.get(&name) {
+                let resp = GetResponse::utf8(hit.value.expose_secret(), hit.ttl_seconds);
+                return serde_json::to_string(&resp).expect("GetResponse always serializes");
+            }
+            // Cache miss with no backend wired (FR-004/FR-005 pending) →
+            // `backend_error` placeholder. Once fnox-core lands, a
+            // successful fetch will `project.cache.insert(name, value, None)`
+            // before constructing the response.
             serde_json::to_string(&ProjectError::new(
                 ProjectErrorCode::BackendError,
                 "backend fetch not yet implemented in this build",
@@ -983,6 +1007,107 @@ mod tests {
         // BAR is now in the allowlist post-reload, so we go to the stub
         // backend path rather than denial.
         assert_eq!(v["code"], "backend_error");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_get_response_and_status_counts_entry() {
+        use secrecy::SecretString;
+
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let registry = server.registry();
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+
+        // Pre-populate the cache as the fetch path will once fnox-core lands.
+        let project = registry
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|p| p.name == "alpha")
+            .expect("project registered");
+        project
+            .cache
+            .insert("FOO".into(), SecretString::from("hello".to_string()), None);
+
+        // get FOO must now return the cached value, not the backend stub.
+        let project_socket = socket_dir.join("alpha.sock");
+        let resp = send_project(&project_socket, r#"{"op":"get","name":"FOO"}"#).await;
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], true, "expected cache hit, got: {resp}");
+        assert_eq!(v["value"], "hello");
+        assert!(v["ttl_seconds"].as_u64().unwrap() > 0);
+
+        // status now reports the cache entry.
+        let status = send_admin(&admin_socket, r#"{"op":"status"}"#).await;
+        let v: Value = serde_json::from_str(&status).unwrap();
+        let p = v["projects"][0].clone();
+        assert_eq!(p["name"], "alpha");
+        assert_eq!(p["cache_entries"], 1);
+
+        // unregister drops the project Arc, which drops the cache, which
+        // zeroizes every entry — the test doesn't inspect post-drop memory
+        // directly but verifies the cache_entries count returns to zero.
+        let _ = send_admin(&admin_socket, r#"{"op":"unregister","name":"alpha"}"#).await;
+        let status = send_admin(&admin_socket, r#"{"op":"status"}"#).await;
+        let v: Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(v["projects"], serde_json::json!([]));
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn allowlist_denial_does_not_consult_cache() {
+        use secrecy::SecretString;
+
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let registry = server.registry();
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+
+        // Insert a cache entry for a name that is NOT in the allowlist.
+        // The denial path must still fire — FR-012 says the allowlist
+        // check happens before any other work.
+        let project = registry.snapshot().await.into_iter().next().unwrap();
+        project
+            .cache
+            .insert("BAR".into(), SecretString::from("oops".to_string()), None);
+        let project_socket = socket_dir.join("alpha.sock");
+        let resp = send_project(&project_socket, r#"{"op":"get","name":"BAR"}"#).await;
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "denied");
+        assert!(
+            v.get("value").is_none(),
+            "denied response must not leak a value"
+        );
 
         server_handle.abort();
         let _ = server_handle.await;
