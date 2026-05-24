@@ -93,6 +93,39 @@ jobs:
       - run: sudo install -m 0755 /bin/true /usr/bin/remo-broker
       - run: systemd-analyze verify packaging/systemd/remo-broker.service
 
+  harnesses:
+    name: soak + killtest (short)
+    runs-on: ubuntu-latest
+    # Runs the SC-002 soak harness and SC-003 killtest at small scale
+    # on every PR — catches regressions in the patterns those harnesses
+    # exercise (concurrent fetches, restart cleanup, audit-log integrity
+    # under SIGKILL). Full SC-002 (50 sockets × 10 Hz × 1h) lives in
+    # the scheduled `.github/workflows/soak.yml` workflow.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - run: cargo build --release --examples
+      - name: soak (5s smoke)
+        run: cargo run --release --example soak
+      - name: killtest (5 rounds)
+        run: cargo run --release --example killtest
+
+  benches:
+    name: benches (compile)
+    runs-on: ubuntu-latest
+    # NFR-001/NFR-002 benchmarks live in benches/latency.rs. Full runs
+    # take ~15s and produce noisy timing data; CI just ensures they
+    # still compile and a `--quick` pass returns. Real numbers come
+    # from manual `cargo bench` runs by humans.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - run: cargo bench --bench latency -- --quick
+
   nfr:
     name: NFR measurements
     runs-on: ubuntu-latest

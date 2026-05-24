@@ -1,0 +1,43 @@
+name: SC-002 full soak
+
+# SC-002: a 1-hour soak with 50 simulated devcontainers performing mixed
+# get/ping/info at 10 Hz each. Lives in its own workflow because (a)
+# the workload is 50 × 10 × 3600 = ~1.8M ops and runs ~1h, far longer
+# than per-PR CI tolerates, and (b) the regression signal is "did
+# anything degrade overnight" rather than "does this PR break."
+#
+# Scheduled to run nightly at 04:00 UTC and manually triggerable.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'soak duration in seconds (default 3600 = 1h)'
+        required: false
+        default: '3600'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  soak:
+    name: soak (full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - run: cargo build --release --example soak
+      - name: soak (full SC-002 config)
+        env:
+          SOAK_PROJECTS: '50'
+          SOAK_WORKERS_PER_PROJ: '1'
+          SOAK_OPS_PER_SEC: '10'
+          SOAK_DURATION_SECS: ${{ github.event.inputs.duration_secs || '3600' }}
+          SOAK_RSS_CAP_MIB: '60'
+        run: cargo run --release --example soak
