@@ -67,3 +67,14 @@ jobs:
         with:
           command: check
           arguments: --all-features
+
+  packaging:
+    name: systemd unit lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # systemd-analyze fails the exec-check unless /usr/bin/remo-broker
+      # is present; stub with /bin/true so verify only complains about
+      # real unit-syntax issues.
+      - run: sudo install -m 0755 /bin/true /usr/bin/remo-broker
+      - run: systemd-analyze verify packaging/systemd/remo-broker.service

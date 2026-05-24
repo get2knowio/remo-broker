@@ -1,0 +1,94 @@
+[Unit]
+Description=Remo on-instance credential broker
+Documentation=https://github.com/get2knowio/remo-broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# FR-021: the daemon calls sd_notify(READY=1) after sockets bind.
+Type=notify
+NotifyAccess=main
+
+# --bootstrap-token-path picks up the token systemd dropped in
+# $CREDENTIALS_DIRECTORY (see LoadCredential* below). --fnox-config is
+# left to the operator to set if /etc/fnox.toml / ~/.config/fnox isn't
+# in the discover chain.
+ExecStart=/usr/bin/remo-broker --bootstrap-token-path %d/bootstrap-token
+
+# FR-022: in-flight requests get up to SHUTDOWN_DRAIN (5 s) on SIGTERM;
+# allow margin before systemd escalates to SIGKILL.
+TimeoutStopSec=10s
+
+Restart=on-failure
+RestartSec=5s
+
+# ---- FR-023 baseline hardening ---------------------------------------
+LimitCORE=0
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+
+# Daemon identity. The system user/group is created by
+# packaging/sysusers.d/remo-broker.conf.
+User=remo-broker
+Group=remo-broker
+
+# Writeable paths. systemd creates these on unit start (mode set
+# below) and tears them down on stop. /run/remo-broker holds the
+# admin + project sockets; /var/log/remo-broker holds the audit log.
+RuntimeDirectory=remo-broker
+RuntimeDirectoryMode=0755
+LogsDirectory=remo-broker
+LogsDirectoryMode=0750
+ReadWritePaths=/run/remo-broker /var/log/remo-broker
+
+# ---- Bootstrap-token credential --------------------------------------
+#
+# Pick ONE of the two lines below based on your instance's
+# capabilities. The daemon doesn't care which path supplied it — it
+# just reads $CREDENTIALS_DIRECTORY/bootstrap-token.
+#
+# (A) TPM2-sealed (preferred where available). Pre-encrypt the token
+#     once via `sudo systemd-creds encrypt --name=bootstrap-token \
+#       /etc/remo-broker/bootstrap-token /etc/remo-broker/bootstrap-token.cred`
+#     and ship the .cred file. systemd unseals it at unit start; the
+#     plaintext exists only inside the credentials directory tmpfs.
+#LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token.cred
+#
+# (B) Plaintext on disk (fallback). Rely on file mode 0600 +
+#     ProtectSystem=strict to keep it private. Recommended only when
+#     TPM2 isn't available.
+LoadCredential=bootstrap-token:/etc/remo-broker/bootstrap-token
+
+# ---- Defense-in-depth (above the FR-023 baseline) --------------------
+#
+# Standard systemd hardening. Safe defaults for this daemon; PrivateDevices
+# and the SystemCallFilter are the most likely directives to need
+# relaxing if a particular fnox-core provider needs raw hardware access
+# (e.g. YubiKey via /dev/hidraw* through hidapi).
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Capability surface — the daemon binds Unix sockets and reads/writes
+# files in its RuntimeDirectory/LogsDirectory. It needs no capabilities.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
