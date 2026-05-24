@@ -143,6 +143,13 @@ impl BoundedCache {
         self.lock().map.is_empty()
     }
 
+    /// The cache's current default TTL. Used by callers (the `get` handler)
+    /// that need to report `ttl_seconds` for a freshly-fetched value before
+    /// re-reading it from the cache.
+    pub fn default_ttl(&self) -> Duration {
+        self.lock().default_ttl
+    }
+
     /// Update the cache's bounds. Applies to **new** inserts only — current
     /// entries are not evicted to fit a smaller cap. Called from
     /// `ProjectRegistry::reload` when the manifest's `[cache]` block changes.

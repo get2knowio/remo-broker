@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use remo_broker::audit::{AuditWriter, WriterShutdown};
+use remo_broker::backend::BackendSession;
 use remo_broker::bootstrap::fetch_token;
 use remo_broker::config::{BootstrapSource, BootstrapSourceKind, Config, Overrides};
 use remo_broker::server::Server;
@@ -47,6 +48,11 @@ struct Cli {
     /// Override the backend fetch timeout in milliseconds.
     #[arg(long, value_name = "MS")]
     backend_fetch_timeout_ms: Option<u32>,
+
+    /// Path to a `fnox.toml` for the backend session. If omitted, the broker
+    /// uses `Fnox::discover()` (walks upward from cwd, merges config chain).
+    #[arg(long, value_name = "PATH")]
+    fnox_config_path: Option<PathBuf>,
 }
 
 impl Cli {
@@ -60,6 +66,7 @@ impl Cli {
             cache_default_ttl_seconds,
             cache_default_max_entries,
             backend_fetch_timeout_ms,
+            fnox_config_path,
         } = self;
         (
             config,
@@ -71,6 +78,7 @@ impl Cli {
                 cache_default_ttl_seconds,
                 cache_default_max_entries,
                 backend_fetch_timeout_ms,
+                fnox_config_path,
             },
         )
     }
@@ -107,16 +115,40 @@ async fn main() -> anyhow::Result<()> {
 
     let (audit, audit_handle) = AuditWriter::spawn(config.audit_log_path.clone());
 
+    // FR-004/FR-005: construct the fnox-core session once. We tolerate
+    // failure here so the daemon stays useful for admin / ping / info /
+    // cache-hit traffic even if fnox config is broken — but loudly warn
+    // so the operator knows `get` will return `backend_error` until they
+    // fix it. An explicit `--fnox-config /typo` is the exception: if the
+    // operator named a file, missing or unreadable is a hard error.
+    let backend = match &config.fnox_config_path {
+        Some(path) => Some(BackendSession::open(path).map_err(|e| {
+            eprintln!("error: backend session: {e}");
+            anyhow::Error::new(e).context("fnox-core session could not be opened")
+        })?),
+        None => match BackendSession::discover() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "fnox-core session could not be discovered; `get` will return backend_error until --fnox-config is provided or fnox.toml is reachable"
+                );
+                None
+            }
+        },
+    };
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         socket_dir = %config.socket_dir.display(),
         audit_log_path = %config.audit_log_path.display(),
         cache_default_ttl_secs = config.cache_default_ttl.as_secs(),
         bootstrap_ok = true,
+        backend_ready = backend.is_some(),
         "remo-broker starting"
     );
 
-    Server::new(config, audit).run().await?;
+    Server::new(config, audit, backend).run().await?;
 
     // Wait for the audit writer to drain after Server::run dropped its handle.
     let WriterShutdown {

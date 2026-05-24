@@ -13,9 +13,11 @@
 //!   then exiting cleanly.
 //! - FR-024: per-connection spawn — no global serialization across projects.
 //!
-//! `rotate-bootstrap` and the actual backend fetch in `get` remain stubbed
-//! (returning `internal_error` / `backend_error`) until fnox-core integration
-//! lands. Allowlist denial in `get` is fully wired (FR-012).
+//! Backend retrieval delegates to `BackendSession` (fnox-core). When the
+//! daemon starts without a usable session (no `--fnox-config`, no
+//! discoverable `fnox.toml`) it degrades: admin/ping/info/cache-hit traffic
+//! continues to work; `get` cache misses surface as `backend_error` and
+//! `rotate-bootstrap` returns `bootstrap_error`.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -32,17 +34,19 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::audit::{
     AuditEvent, AuditWriter, Decision, FetchEvent, Outcome, ShutdownEvent, WriterShutdown,
 };
+use crate::backend::BackendSession;
+use crate::bootstrap::fetch_token;
 use crate::config::{BootstrapSource, Config};
 use crate::proto::MAX_MESSAGE_BYTES;
 use crate::proto::admin::{
     AdminError, AdminErrorCode, AdminRequest, BootstrapMode, OkResponse, ProjectStatus,
-    RegisterResponse, ReloadResponse, StatusResponse,
+    RegisterResponse, ReloadResponse, RotateBootstrapResponse, StatusResponse,
 };
 use crate::proto::project::{
     GetResponse, InfoResponse, PingResponse, ProjectError, ProjectErrorCode, ProjectRequest,
 };
 use crate::registry::{CacheDefaults, Project, ProjectRegistry, RegistryError};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 
 /// Max time the daemon waits for in-flight admin connections to finish
 /// after SIGTERM. Beyond this we abort the JoinSet and exit (FR-022).
@@ -87,6 +91,12 @@ pub struct Server {
     audit: AuditWriter,
     started_at: Instant,
     registry: Arc<ProjectRegistry>,
+    /// Backend session (`fnox-core`). `None` means the broker started in
+    /// degraded mode — `get` returns `backend_error`, `rotate-bootstrap`
+    /// returns `bootstrap_error`. Constructed by `main.rs`; never installed
+    /// or torn down by `Server` itself (only `rotate-bootstrap` swaps the
+    /// inner `Fnox`).
+    backend: Option<BackendSession>,
     /// Accept-loop `JoinHandle`s for currently-registered projects, keyed by
     /// project name. Populated on `register`, drained on `unregister` /
     /// shutdown. Held inside a `Mutex` (not `RwLock`) because the only
@@ -95,7 +105,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(config: Config, audit: AuditWriter) -> Self {
+    pub fn new(config: Config, audit: AuditWriter, backend: Option<BackendSession>) -> Self {
         let cache_defaults = CacheDefaults {
             max_entries: config.cache_default_max_entries,
             ttl: config.cache_default_ttl,
@@ -109,6 +119,7 @@ impl Server {
             audit,
             started_at: Instant::now(),
             registry,
+            backend,
             project_tasks: Mutex::new(HashMap::new()),
         }
     }
@@ -210,6 +221,7 @@ impl Server {
                 audit: arc.audit.clone(),
                 started_at: arc.started_at,
                 registry: arc.registry.clone(),
+                backend: arc.backend.clone(),
                 project_tasks: Mutex::new(HashMap::new()),
             }
         });
@@ -382,12 +394,62 @@ async fn dispatch_admin(server: &Arc<Server>, req: AdminRequest) -> String {
         }
         AdminRequest::Unregister { name } => dispatch_unregister(server, &name).await,
         AdminRequest::Reload { name } => dispatch_reload(server, &name).await,
-        AdminRequest::RotateBootstrap => serde_json::to_string(&AdminError::new(
-            AdminErrorCode::InternalError,
-            "rotate-bootstrap not yet implemented in this build",
-        ))
-        .expect("AdminError always serializes"),
+        AdminRequest::RotateBootstrap => dispatch_rotate_bootstrap(server).await,
     }
+}
+
+/// User Story 5: re-read the bootstrap token, re-construct the fnox-core
+/// session, and atomically swap it in. On any failure the old session is
+/// kept (User Story 5 acceptance scenario 3) and we return `bootstrap_error`
+/// — the daemon keeps serving from cache.
+///
+/// Cache entries from before the rotation survive because the cache lives
+/// on `Project`, not on the backend session.
+async fn dispatch_rotate_bootstrap(server: &Arc<Server>) -> String {
+    let Some(backend) = server.backend.as_ref() else {
+        return serde_json::to_string(&AdminError::new(
+            AdminErrorCode::BootstrapError,
+            "no fnox-core session is configured; restart the daemon with --fnox-config",
+        ))
+        .expect("AdminError always serializes");
+    };
+
+    // FR-003-style validation: confirm a usable bootstrap token still exists
+    // before touching the backend session. If the operator wrote a new
+    // token file, this re-reads it; if the file went away, we surface the
+    // error without disturbing the in-flight session.
+    if let Err(e) = fetch_token(&server.config.bootstrap).await {
+        return serde_json::to_string(&AdminError::new(
+            AdminErrorCode::BootstrapError,
+            format!("bootstrap token unavailable: {e}"),
+        ))
+        .expect("AdminError always serializes");
+    }
+
+    // Construct a fresh Fnox using the same config path policy as startup
+    // (open if explicitly named, else discover).
+    let new = match &server.config.fnox_config_path {
+        Some(path) => BackendSession::open(path),
+        None => BackendSession::discover(),
+    };
+    let new = match new {
+        Ok(b) => b,
+        Err(e) => {
+            return serde_json::to_string(&AdminError::new(
+                AdminErrorCode::BootstrapError,
+                format!("failed to rebuild fnox-core session: {e}"),
+            ))
+            .expect("AdminError always serializes");
+        }
+    };
+
+    // Adopt the new session by atomic swap. Existing in-flight `get` calls
+    // that already loaded the old Fnox arc complete against it; subsequent
+    // calls see the new one.
+    backend.adopt(&new);
+    tracing::info!("rotate-bootstrap: fnox-core session swapped");
+    serde_json::to_string(&RotateBootstrapResponse::ok())
+        .expect("RotateBootstrapResponse always serializes")
 }
 
 async fn dispatch_status(server: &Arc<Server>) -> String {
@@ -566,7 +628,7 @@ async fn handle_project_connection(
         // time inside the broker, not end-to-end including socket flush.
         let start = Instant::now();
         let response_json = match serde_json::from_slice::<ProjectRequest>(&line) {
-            Ok(req) => dispatch_project(&server, &project, req, peer_pid, peer_uid, start),
+            Ok(req) => dispatch_project(&server, &project, req, peer_pid, peer_uid, start).await,
             // Protocol errors are not "fetch attempts" — there's no parseable
             // secret name to record — so no audit event is emitted here.
             Err(e) => serde_json::to_string(&ProjectError::new(
@@ -581,7 +643,7 @@ async fn handle_project_connection(
     }
 }
 
-fn dispatch_project(
+async fn dispatch_project(
     server: &Server,
     project: &Project,
     req: ProjectRequest,
@@ -606,53 +668,138 @@ fn dispatch_project(
             serde_json::to_string(&resp).expect("InfoResponse always serializes")
         }
         ProjectRequest::Get { name } => {
-            let manifest = project.manifest();
-            // FR-012: allowlist denial does not incur a backend round-trip
-            // and does not consult the cache.
-            if !manifest.allowlist.secrets.iter().any(|n| n == &name) {
-                emit_fetch(
-                    &server.audit,
-                    &project.name,
-                    &name,
-                    Decision::Deny,
-                    Outcome::Ok,
-                    peer_pid,
-                    peer_uid,
-                    start,
-                    None,
-                    Some("allowlist"),
-                );
-                return serde_json::to_string(&ProjectError::new(
-                    ProjectErrorCode::Denied,
-                    format!("Secret {name:?} is not in this project's allowlist."),
-                ))
-                .expect("ProjectError always serializes");
-            }
-            // Cache hit short-circuits the backend (FR-014). The plaintext
-            // boundary is here — `expose_secret()` is the one place per
-            // request where the value materialises outside `SecretString`,
-            // and it's immediately handed to `serde_json` to write to the
-            // socket.
-            if let Some(hit) = project.cache.get(&name) {
-                emit_fetch(
-                    &server.audit,
-                    &project.name,
-                    &name,
-                    Decision::Allow,
-                    Outcome::Ok,
-                    peer_pid,
-                    peer_uid,
-                    start,
-                    Some("cache"),
-                    None,
-                );
-                let resp = GetResponse::utf8(hit.value.expose_secret(), hit.ttl_seconds);
-                return serde_json::to_string(&resp).expect("GetResponse always serializes");
-            }
-            // Cache miss with no backend wired (FR-004/FR-005 pending) →
-            // `backend_error` placeholder. Once fnox-core lands, a
-            // successful fetch will `project.cache.insert(name, value, None)`
-            // before constructing the response.
+            dispatch_get(server, project, name, peer_pid, peer_uid, start).await
+        }
+    }
+}
+
+async fn dispatch_get(
+    server: &Server,
+    project: &Project,
+    name: String,
+    peer_pid: Option<i32>,
+    peer_uid: Option<u32>,
+    start: Instant,
+) -> String {
+    let manifest = project.manifest();
+    // FR-012: allowlist denial does not incur a backend round-trip and
+    // does not consult the cache.
+    if !manifest.allowlist.secrets.iter().any(|n| n == &name) {
+        emit_fetch(
+            &server.audit,
+            &project.name,
+            &name,
+            Decision::Deny,
+            Outcome::Ok,
+            peer_pid,
+            peer_uid,
+            start,
+            None,
+            Some("allowlist"),
+        );
+        return serde_json::to_string(&ProjectError::new(
+            ProjectErrorCode::Denied,
+            format!("Secret {name:?} is not in this project's allowlist."),
+        ))
+        .expect("ProjectError always serializes");
+    }
+
+    // Cache hit short-circuits the backend (FR-014). The plaintext boundary
+    // is here — `expose_secret()` is the one place per request where the
+    // value materialises outside `SecretString`, and it's immediately
+    // handed to `serde_json` to write to the socket.
+    if let Some(hit) = project.cache.get(&name) {
+        emit_fetch(
+            &server.audit,
+            &project.name,
+            &name,
+            Decision::Allow,
+            Outcome::Ok,
+            peer_pid,
+            peer_uid,
+            start,
+            Some("cache"),
+            None,
+        );
+        let resp = GetResponse::utf8(hit.value.expose_secret(), hit.ttl_seconds);
+        return serde_json::to_string(&resp).expect("GetResponse always serializes");
+    }
+
+    // Cache miss — go to the backend. If no backend was constructed at
+    // startup (degraded mode), return backend_error directly. Otherwise
+    // call fnox-core.
+    let Some(backend) = server.backend.as_ref() else {
+        emit_fetch(
+            &server.audit,
+            &project.name,
+            &name,
+            Decision::Allow,
+            Outcome::BackendError,
+            peer_pid,
+            peer_uid,
+            start,
+            None,
+            None,
+        );
+        return serde_json::to_string(&ProjectError::new(
+            ProjectErrorCode::BackendError,
+            "no fnox-core session is configured; rerun the daemon with --fnox-config",
+        ))
+        .expect("ProjectError always serializes");
+    };
+
+    match backend.get(&name).await {
+        Ok(Some(plaintext)) => {
+            // Cache before responding so concurrent in-flight gets converge
+            // on the same TTL window. The cache stores a SecretString
+            // clone; the plaintext String stays around until this scope
+            // ends (after the response is serialized).
+            project
+                .cache
+                .insert(name.clone(), SecretString::from(plaintext.clone()), None);
+            let ttl_seconds =
+                u32::try_from(project.cache.default_ttl().as_secs()).unwrap_or(u32::MAX);
+            emit_fetch(
+                &server.audit,
+                &project.name,
+                &name,
+                Decision::Allow,
+                Outcome::Ok,
+                peer_pid,
+                peer_uid,
+                start,
+                Some("fnox"),
+                None,
+            );
+            let resp = GetResponse::utf8(plaintext, ttl_seconds);
+            serde_json::to_string(&resp).expect("GetResponse always serializes")
+        }
+        Ok(None) => {
+            // FR-017 Outcome::NotFound: the backend resolved the name but
+            // the value was absent (fnox `if_missing = "ignore"` / "warn").
+            emit_fetch(
+                &server.audit,
+                &project.name,
+                &name,
+                Decision::Allow,
+                Outcome::NotFound,
+                peer_pid,
+                peer_uid,
+                start,
+                Some("fnox"),
+                None,
+            );
+            serde_json::to_string(&ProjectError::new(
+                ProjectErrorCode::NotFound,
+                format!("Secret {name:?} not found by fnox-core resolver."),
+            ))
+            .expect("ProjectError always serializes")
+        }
+        Err(msg) => {
+            // fnox-core's error type doesn't distinguish "unreachable" from
+            // "auth failed" from "provider misconfigured", so everything
+            // surfaces as `backend_error` with the message attached for
+            // operator triage.
             emit_fetch(
                 &server.audit,
                 &project.name,
@@ -662,12 +809,12 @@ fn dispatch_project(
                 peer_pid,
                 peer_uid,
                 start,
-                None,
+                Some("fnox"),
                 None,
             );
             serde_json::to_string(&ProjectError::new(
                 ProjectErrorCode::BackendError,
-                "backend fetch not yet implemented in this build",
+                format!("fnox-core: {msg}"),
             ))
             .expect("ProjectError always serializes")
         }
@@ -802,7 +949,7 @@ mod tests {
         let audit_log = dir.path().join("audit.log");
         let config = test_config(&socket_dir, &audit_log);
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(config, audit);
+        let server = Server::new(config, audit, None);
 
         let server_handle = tokio::spawn(server.run());
 
@@ -838,7 +985,7 @@ mod tests {
         let audit_log = dir.path().join("audit.log");
         let config = test_config(&socket_dir, &audit_log);
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(config, audit);
+        let server = Server::new(config, audit, None);
         let server_handle = tokio::spawn(server.run());
 
         let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
@@ -913,14 +1060,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_bootstrap_returns_internal_error() {
-        // Only remaining stub on the admin plane; fnox-core integration
-        // replaces this with a real backend re-auth.
+    async fn rotate_bootstrap_with_no_backend_returns_bootstrap_error() {
+        // backend=None (degraded mode): rotate-bootstrap can't construct a
+        // new session since none was wired at startup. Returns
+        // bootstrap_error with a hint pointing the operator at
+        // --fnox-config.
         let dir = tempdir();
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let server_handle = tokio::spawn(server.run());
 
         let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
@@ -929,7 +1078,48 @@ mod tests {
         let response = send_admin(&admin_socket, r#"{"op":"rotate-bootstrap"}"#).await;
         let v: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(v["ok"], false);
-        assert_eq!(v["code"], "internal_error");
+        assert_eq!(v["code"], "bootstrap_error");
+        assert!(
+            v["message"].as_str().unwrap().contains("--fnox-config"),
+            "expected hint about --fnox-config, got: {}",
+            v["message"]
+        );
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn get_with_no_backend_returns_backend_error_with_hint() {
+        // Mirror of the rotate test for the data plane: when backend=None
+        // a cache miss must surface as backend_error mentioning
+        // --fnox-config so the operator knows how to fix it.
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+
+        let project_socket = socket_dir.join("alpha.sock");
+        let resp = send_project(&project_socket, r#"{"op":"get","name":"FOO"}"#).await;
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "backend_error");
+        assert!(
+            v["message"].as_str().unwrap().contains("--fnox-config"),
+            "expected hint about --fnox-config, got: {}",
+            v["message"]
+        );
 
         server_handle.abort();
         let _ = server_handle.await;
@@ -941,7 +1131,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let server_handle = tokio::spawn(server.run());
 
         let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
@@ -1015,7 +1205,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let server_handle = tokio::spawn(server.run());
 
         let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
@@ -1041,7 +1231,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let server_handle = tokio::spawn(server.run());
 
         let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
@@ -1068,7 +1258,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let server_handle = tokio::spawn(server.run());
 
         let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
@@ -1112,7 +1302,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let registry = server.registry();
         let server_handle = tokio::spawn(server.run());
 
@@ -1171,7 +1361,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let registry = server.registry();
         let server_handle = tokio::spawn(server.run());
 
@@ -1243,7 +1433,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let registry = server.registry();
         let server_handle = tokio::spawn(server.run());
 
@@ -1334,7 +1524,7 @@ mod tests {
         let socket_dir = dir.path().join("run");
         let audit_log = dir.path().join("audit.log");
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, None);
         let registry = server.registry();
         let server_handle = tokio::spawn(server.run());
 
@@ -1382,7 +1572,7 @@ mod tests {
         let audit_log = dir.path().join("audit.log");
         let config = test_config(&socket_dir, &audit_log);
         let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(config, audit);
+        let server = Server::new(config, audit, None);
         let server_handle = tokio::spawn(server.run());
 
         // The bind should succeed despite the stale file (FR-009).

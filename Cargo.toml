@@ -18,6 +18,12 @@ path = "src/main.rs"
 anyhow = "1"
 arc-swap = "1"
 clap = { version = "4", features = ["derive", "env"] }
+# FR-004/FR-005: the only backend integration. The broker never touches
+# 1Password/Vault/AWS/age/keychain SDKs directly; everything goes through
+# fnox-core's resolver. Cheap-clone Fnox is shared across project handlers
+# via Arc<ArcSwap<Fnox>> so rotate-bootstrap can swap it atomically. See
+# deny.toml for the (documented) advisories this dep tree introduces.
+fnox-core = "1.25"
 sd-notify = "0.4"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -28,10 +34,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# TODO: add fnox-core once source (crates.io / git / path) is decided.
-# Spec FR-004/FR-005: all backend retrieval goes through fnox-core; no
-# backend-specific code lives in this crate.
 
 [profile.release]
 lto = "thin"

@@ -4,7 +4,34 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Each entry is a *known* advisory we've chosen to ship anyway, with the
+# reason captured here so reviewers can see exactly what we're accepting.
+# Revisit on every dep bump.
+ignore = [
+    # `atty` is unmaintained. Pulled in transitively (clap-deep / cli args
+    # crates). No known vulnerability, just stale. No first-party use.
+    { id = "RUSTSEC-2024-0375", reason = "atty unmaintained; transitive only; no first-party use; no known CVE" },
+
+    # rsa Marvin Attack: remote timing sidechannel for RSA key recovery.
+    # Reaches us via the AWS SDK chain. AWS SigV4 signing uses HMAC (not
+    # RSA); the rsa crate is used only inside TLS cert-chain validation
+    # against AWS-controlled endpoints. Exploitable only with very fine-
+    # grained timing measurement of our outbound TLS — feasible but
+    # bounded. Watching upstream for the fix.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack; transitive via AWS SDK TLS; bounded blast radius (AWS-only endpoints); upstream fix in progress" },
+
+    # rustls-pemfile unmaintained. Transitive via the AWS SDK's hyper-
+    # rustls stack. No known vulnerability; rustls itself is maintained.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive via AWS SDK; no known CVE" },
+
+    # webpki name-constraints / wildcard / CRL-panic advisories. Affect
+    # validation of peer certificates we *receive*; we only connect to
+    # AWS API endpoints, so an attacker would need to MitM the AWS
+    # control plane to weaponize these.
+    { id = "RUSTSEC-2026-0098", reason = "webpki URI name constraints accepted; reaches us via AWS SDK TLS; bounded by AWS-only outbound" },
+    { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name constraints accepted; reaches us via AWS SDK TLS; bounded by AWS-only outbound" },
+    { id = "RUSTSEC-2026-0104", reason = "webpki CRL-parse panic; reaches us via AWS SDK TLS; bounded by AWS-only outbound (and we don't fetch CRLs)" },
+]
 
 [licenses]
 version = 2
@@ -20,6 +47,12 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    # CDLA-Permissive-2.0 (Linux Foundation Community Data License Agreement).
+    # Despite the "Data" in the name, it shows up on a few AWS-adjacent
+    # crates that ship reference data files. Permits redistribution and
+    # modification without obligation; effectively a no-warranty grant.
+    # Not a copyleft license — safe to include.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 

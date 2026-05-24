@@ -5,6 +5,7 @@
 //! binary's CLI surface.
 
 pub mod audit;
+pub mod backend;
 pub mod bootstrap;
 pub mod cache;
 pub mod config;

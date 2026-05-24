@@ -60,6 +60,11 @@ pub struct Config {
     pub cache_default_ttl: Duration,
     pub cache_default_max_entries: u32,
     pub backend_fetch_timeout: Duration,
+    /// Optional path to a `fnox.toml` config the broker passes to
+    /// `fnox_core::Fnox::open`. If `None`, the broker uses
+    /// `Fnox::discover()` (walks upward from cwd and merges the
+    /// parent/local/global config chain), matching the `fnox` CLI.
+    pub fnox_config_path: Option<PathBuf>,
 }
 
 /// The mechanism by which the daemon obtains its long-lived backend identity
@@ -94,6 +99,7 @@ pub struct Overrides {
     pub cache_default_ttl_seconds: Option<u32>,
     pub cache_default_max_entries: Option<u32>,
     pub backend_fetch_timeout_ms: Option<u32>,
+    pub fnox_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -106,6 +112,7 @@ struct RawConfig {
     cache_default_ttl_seconds: Option<u32>,
     cache_default_max_entries: Option<u32>,
     backend_fetch_timeout_ms: Option<u32>,
+    fnox_config_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -206,6 +213,8 @@ impl Config {
             return Err(ConfigError::BackendTimeoutZero);
         }
 
+        let fnox_config_path = overrides.fnox_config_path.clone().or(raw.fnox_config_path);
+
         Ok(Self {
             bootstrap,
             socket_dir,
@@ -213,6 +222,7 @@ impl Config {
             cache_default_ttl: Duration::from_secs(cache_default_ttl_seconds.into()),
             cache_default_max_entries,
             backend_fetch_timeout: Duration::from_millis(backend_fetch_timeout_ms.into()),
+            fnox_config_path,
         })
     }
 }
