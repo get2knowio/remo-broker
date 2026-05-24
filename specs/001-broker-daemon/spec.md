@@ -64,6 +64,57 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | SC-005 | Pending | No red-team harness; depends on FR-007/012. |
 | SC-006 | Pending | Cross-repo CI depends on the Remo Python codebase and fnox-core landing. |
 
+### External Dependencies
+
+Open external decisions that gate forward progress.
+
+| Dependency | State | Blocks |
+|---|---|---|
+| `fnox-core` source/version | Not chosen. Options: crates.io vs git vs local path. | FR-004, FR-005, the real form of FR-016 (currently `secrecy::SecretString` placeholder), the cache implementation, the fetch path, the `rotate-bootstrap` admin op, User Story 6 (multi-backend). |
+| IMDSv2 HTTP client | Not chosen. Probably a lightweight client (`hyper` or `ureq`) hitting `169.254.169.254` for PUT-token-then-GET-credentials. | FR-002b (`bootstrap_source = "imds"` currently returns `BootstrapError::ImdsNotImplemented`). |
+| Mocked metadata endpoint for IMDS tests | Not designed. | IMDSv2 happy-path tests. |
+
+### Key Implementation Decisions
+
+Non-obvious calls made during implementation, with rationale. These are the kind of decisions a future contributor (or future agent session) would otherwise have to re-derive from code archaeology.
+
+| Decision | Rationale | Location |
+|---|---|---|
+| Use `secrecy::SecretString` as a placeholder for fnox-core's `SecretBox`. | Lets us implement zeroize-on-drop and `Debug` redaction today; swap will be a single type-alias when fnox-core lands. | `src/bootstrap.rs` |
+| Audit log uses open-per-write `O_APPEND`. | Spec explicitly endorses it ("no SIGHUP required if using O_APPEND + open-per-write"); makes log rotation transparent; per-write open cost is ~2.5 % of writer-task CPU at SC-002 load. | `src/audit.rs::AuditFile` |
+| Library crate (`src/lib.rs`) + thin binary (`src/main.rs`). | Modules don't need a binary consumer to satisfy dead-code analysis; tests target the library. | `src/lib.rs`, `src/main.rs` |
+| Wire-protocol requests intentionally do **not** set `deny_unknown_fields`. | wire-protocol.md §4 mandates v1 brokers tolerate additive fields from v1.x clients. | `src/proto/{project,admin}.rs` |
+| Config TOML uses strict `deny_unknown_fields`. | Operator-facing config — typos in `/etc/remo-broker/config.toml` should fail loudly. | `src/config.rs::RawConfig` |
+| `time` crate for RFC3339 timestamps (not `chrono` or `jiff`). | Lightweight, no soundness issues, idiomatic; `serde-well-known` feature gives us round-trip serde without custom impls. | `src/audit.rs` |
+| Config precedence: CLI > file > default. | Standard layering; CLI flags are for ad-hoc overrides during ops/debugging. | `src/config.rs::Config::resolve` |
+| `Config::load(None)` tolerates missing default config; `Config::load(Some(p))` treats missing `p` as a hard error. | `--config /typo` should not silently fall back to defaults. | `src/config.rs::Config::load` |
+| `BootstrapSourceKind` (Copy enum for serde/clap) split from `BootstrapSource` (validated, carries per-variant data). | Two distinct concerns: discriminator for parse, full structure for runtime. | `src/config.rs` |
+| `AuditWriter` uses bounded mpsc(1000) + in-memory degraded `VecDeque`(1000), drop-oldest FIFO when full. | FR-018: producers never block. The degraded buffer matches the spec's "last 1000 events" wording. | `src/audit.rs` |
+| `AuditEvent` is tagged on a top-level `event` field, including `"fetch"`. | Spec hinted at the discriminator with `"manifest.invalid"` / `"socket.recovered"`; making it uniform across all variants simplifies downstream log filtering. | `src/audit.rs` |
+| Per-connection `JoinSet` task spawn for admin handlers; no global lock. | FR-024 pattern. Same approach extends to project sockets when they land. | `src/server.rs` |
+| Drain on SIGTERM **and** SIGINT. | Ctrl-C during dev produces the same clean shutdown systemd would. | `src/server.rs::install_sigterm` |
+| Tests use hand-rolled RAII tempdir helpers; no `tempfile` crate dependency. | Helpers are ~15 LoC per module; avoids pulling in a transitive dep just for tests. | every `mod tests` |
+| Tests that mutate env use unique per-test variable names. | `std::env::set_var` is `unsafe` in edition 2024; unique names avoid cross-test races without serializing. | `src/bootstrap.rs::tests` |
+| Protocol-response tests compare serialized JSON to a `json!` literal copied from the wire-protocol doc. | Pins the wire format against silent serde drift; regressions surface as a test failure citing the doc. | `src/proto/{project,admin}.rs::tests` |
+
+### Deferred Work and Roadmap
+
+Items the spec calls for that we've consciously postponed, in roughly the order we plan to tackle them. This list is exhaustive against the requirements above — anything not yet "Done" appears here.
+
+1. **Project registry + admin op handlers** (FR-007 setup, FR-010 wiring, FR-011, FR-019 admin rest). Implement `register` / `unregister` / `reload` handlers backed by a `RwLock<HashMap<String, Project>>`. Per-project state, manifest discovery wiring. Currently the four non-`status` admin handlers are stubs returning `internal_error`.
+2. **Project socket binding + connection loop + `ping`/`info` handlers** (FR-007 sockets, FR-008 project-socket cleanup, FR-012 allowlist check, FR-019 project plane, FR-020 project `ping`). Same NDJSON pattern as the admin socket. The `get` op returns `backend_error` until fnox-core lands.
+3. **In-memory cache** (FR-014, FR-015, FR-016 with `secrecy` placeholder). `BoundedCache<SecretName, CacheEntry>`, TTL eviction, zeroize on drop / eviction / `unregister`.
+4. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox`; wire up the actual backend fetch.
+5. **Per-fetch audit emission** (FR-013, the emission half of FR-017). Connect the fetch path into the existing `AuditWriter`.
+6. **IMDSv2 bootstrap source** (FR-002b). Small HTTP client against `169.254.169.254`; mocked metadata endpoint in tests.
+7. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core.
+8. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`.
+9. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
+10. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
+11. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
+12. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket auth code can land in its final form.
+13. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+
 ## Background and Motivation
 
 The Remo credential-broker feature (spec'd in `get2knowio/remo` at `specs/005-credential-broker/spec.md`) defends against supply-chain attacks by removing long-lived developer credentials from Remo instances. The on-instance half of that design — the **broker daemon** — is the subject of this spec.
