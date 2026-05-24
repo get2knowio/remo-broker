@@ -49,7 +49,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | NFR-002 | Unverified | Backend path exists via `BackendSession::get`; no cold-latency harness yet. The broker-overhead budget (≤20 ms) is small compared with realistic backend RTTs (AWS Secrets Manager ~50–200 ms), so the headroom is plausible — but unmeasured. Lands with the SC-002 soak / a dedicated cold-fetch benchmark. |
 | NFR-003 | Done | `ci/measure_nfr.sh` measures startup-to-`status`-ready and fails the build if >500 ms. Latest measurement: **~90 ms** on Ubuntu CI runners. |
 | NFR-004 | Done | Same script samples `VmRSS` after a 2 s idle window and fails the build if >30 MiB. Latest measurement: **~6 MiB** idle. |
-| NFR-005 | **Fails** (informational only) | Same script reports binary size. Current release build: **~32 MiB**, vs the 15 MiB target. Cause: fnox-core's transitive AWS SDK + `ctap-hid-fido2` (YubiKey/WebAuthn) + hyper/rustls dep chain. CI prints a `::warning::` but does not fail the job. Closing the gap requires either (a) feature-gating providers in fnox-core upstream, (b) a custom slim fnox-core build, or (c) accepting the larger size and revising the NFR. Tracked in the roadmap. |
+| NFR-005 | **Fails** (informational only) | Same script reports binary size. Current release build: **~32 MiB**, vs the 15 MiB target. Per-crate breakdown captured in [`docs/binary-size.md`](../../docs/binary-size.md) — top contributors are fnox-core's unconditionally-compiled providers (Google Cloud, KeePass), three crypto libs (openssl_sys + aws_lc_sys + rustls+ring), and h2/hyper. CI prints a `::warning::` but does not fail. Realistic reduction with feature-gating + single-TLS + LTO/opt-z is ~7-12 MiB → ~20-25 MiB final; reaching 15 MiB likely needs a musl build or a target revision. Tracked in the roadmap. |
 | NFR-006 | Done | `rust-toolchain.toml` pins stable; `Cargo.toml` `rust-version = "1.95"`. |
 | NFR-007 | Done | `.github/workflows/ci.yml` runs fmt + `clippy --all-targets -- -D warnings` + test + `cargo audit` + `cargo deny`. fnox-core's transitive dep tree introduces six known RUSTSEC advisories (atty/rustls-pemfile unmaintained; rsa Marvin Attack; three webpki cert-validation issues) bounded to outbound AWS TLS; all are documented and ignored in `deny.toml` with per-entry rationales and mirrored into the rustsec/audit-check action's `ignore` input. Revisit on every dep bump. |
 
@@ -57,7 +57,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 
 | ID | Status | Notes |
 |---|---|---|
-| SC-001 | Pending | No fuzz harness against the NDJSON parser yet. |
+| SC-001 | Partial | `src/proto/mod.rs::smoke_fuzz` runs 40 000 deterministically-seeded random-byte iterations (10k × 2 parsers × 2 shapes) through `ProjectRequest` + `AdminRequest` deserialization on every `cargo test` run. The 24-hour `cargo-fuzz` campaign required by SC-001's wording is still pending — smoke fuzz catches obvious bugs but isn't a substitute for proper long-form fuzzing. |
 | SC-002 | Pending | No soak harness yet. |
 | SC-003 | Pending | No killtest harness yet. |
 | SC-004 | Done (for the audit-log half) | Structural guarantee in `src/audit.rs` plus the runtime check in `audit_never_contains_secret_value` — plants a distinctive tripwire value, drives a cache hit, greps the on-disk audit log. The "daemon stdout/stderr" half of SC-004 still relies on the broader integration harness. |

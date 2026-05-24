@@ -63,6 +63,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: List accepted advisories (visibility)
+        # Surfaces deny.toml's [advisories].ignore list in every CI run
+        # so the six accepted RUSTSEC entries stay visible. Without this
+        # they're easy to forget and quietly become permanent.
+        run: |
+          echo "::group::Accepted RUSTSEC advisories (deny.toml ignore list)"
+          awk '
+            /^\[advisories\]/ { in_adv = 1; next }
+            /^\[/ && !/^\[advisories\]/ { in_adv = 0 }
+            in_adv && /RUSTSEC-/ {
+              print
+            }
+          ' deny.toml
+          echo "::endgroup::"
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
