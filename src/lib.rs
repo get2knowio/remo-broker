@@ -4,6 +4,7 @@
 //! substance lives here so it can be unit-tested without going through the
 //! binary's CLI surface.
 
+pub mod audit;
 pub mod bootstrap;
 pub mod config;
 pub mod manifest;
