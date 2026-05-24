@@ -1,0 +1,38 @@
+[package]
+name = "remo-broker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "On-instance credential broker daemon for Remo. Holds a per-instance bootstrap token and serves per-project Unix sockets with allowlist enforcement."
+license = "Apache-2.0"
+repository = "https://github.com/get2knowio/remo-broker"
+readme = "README.md"
+keywords = ["secrets", "credentials", "broker", "daemon"]
+categories = ["command-line-utilities", "authentication"]
+
+[[bin]]
+name = "remo-broker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+clap = { version = "4", features = ["derive", "env"] }
+sd-notify = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# TODO: add fnox-core once source (crates.io / git / path) is decided.
+# Spec FR-004/FR-005: all backend retrieval goes through fnox-core; no
+# backend-specific code lives in this crate.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
