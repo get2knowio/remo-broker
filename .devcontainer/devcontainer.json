@@ -1,0 +1,33 @@
+{
+    "name": "Rust Agentic Development",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+    "features": {
+        "ghcr.io/devcontainers/features/rust:1": {},
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "22"
+        },
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "version": "latest",
+            "enableNonRootDocker": "true"
+        },
+        "ghcr.io/devcontainers/features/aws-cli:1": {},
+        "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/eitsupi/devcontainer-features/jq-likes:2": {},
+        "ghcr.io/get2knowio/devcontainer-features/ai-clis:2": {},
+        // install/omit: claudeCode, geminiCli, codex, copilot, openCode, codeRabbit, beads, specifyCli
+        "ghcr.io/get2knowio/devcontainer-features/modern-cli-tools:2": {},
+        // install/omit: bat, ripgrep, fd, fzf, eza, zoxide, neovim, tmux, lazygit, astGrep, jujutsu, zellij, starship
+        "ghcr.io/get2knowio/devcontainer-features/rust-dev-tools:2": {},
+        // install/omit: bacon, cargoEdit, cargoAudit
+        "ghcr.io/get2knowio/devcontainer-features/github-actions-tools:2": {}
+        // install/omit: act, actionlint
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "zsh"
+            }
+        }
+    },
+    "postCreateCommand": "rustc --version && node --version"
+}
