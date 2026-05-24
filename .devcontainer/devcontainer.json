@@ -1,6 +1,6 @@
 {
     "name": "Rust Agentic Development",
-    "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
     "features": {
         "ghcr.io/devcontainers/features/rust:1": {},
         "ghcr.io/devcontainers/features/node:1": {
@@ -13,9 +13,13 @@
         "ghcr.io/devcontainers/features/aws-cli:1": {},
         "ghcr.io/devcontainers/features/github-cli:1": {},
         "ghcr.io/eitsupi/devcontainer-features/jq-likes:2": {},
-        "ghcr.io/get2knowio/devcontainer-features/ai-clis:2": {},
+        "ghcr.io/get2knowio/devcontainer-features/ai-clis:2": {
+            "install": "claudeCode,codex,copilot,specifyCli"
+        },
         // install/omit: claudeCode, geminiCli, codex, copilot, openCode, codeRabbit, beads, specifyCli
-        "ghcr.io/get2knowio/devcontainer-features/modern-cli-tools:2": {},
+        "ghcr.io/get2knowio/devcontainer-features/modern-cli-tools:2": {
+            "omit": "jujutsu"
+        },
         // install/omit: bat, ripgrep, fd, fzf, eza, zoxide, neovim, tmux, lazygit, astGrep, jujutsu, zellij, starship
         "ghcr.io/get2knowio/devcontainer-features/rust-dev-tools:2": {},
         // install/omit: bacon, cargoEdit, cargoAudit
