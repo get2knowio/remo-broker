@@ -51,7 +51,12 @@ struct Cli {
 
     /// Path to a `fnox.toml` for the backend session. If omitted, the broker
     /// uses `Fnox::discover()` (walks upward from cwd, merges config chain).
-    #[arg(long, value_name = "PATH")]
+    //
+    // The CLI flag is `--fnox-config` (not the auto-derived `--fnox-config-path`)
+    // so it reads naturally next to the other path flags — and so all the
+    // error-message hints across the codebase ("rerun the daemon with
+    // --fnox-config") line up with what the operator actually types.
+    #[arg(long = "fnox-config", value_name = "PATH")]
     fnox_config_path: Option<PathBuf>,
 }
 
