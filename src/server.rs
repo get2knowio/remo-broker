@@ -29,7 +29,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::audit::{AuditEvent, AuditWriter, ShutdownEvent, WriterShutdown};
+use crate::audit::{
+    AuditEvent, AuditWriter, Decision, FetchEvent, Outcome, ShutdownEvent, WriterShutdown,
+};
 use crate::config::{BootstrapSource, Config};
 use crate::proto::MAX_MESSAGE_BYTES;
 use crate::proto::admin::{
@@ -542,6 +544,13 @@ async fn handle_project_connection(
     project: Arc<Project>,
     stream: UnixStream,
 ) -> std::io::Result<()> {
+    // FR-017: peer_pid + peer_uid in audit events. `peer_cred()` is the
+    // SO_PEERCRED lookup; it almost never fails on a connected stream, but
+    // if it does we fall back to None on both fields.
+    let peer = stream.peer_cred().ok();
+    let peer_pid = peer.as_ref().and_then(|c| c.pid());
+    let peer_uid = peer.as_ref().map(|c| c.uid());
+
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = Vec::with_capacity(256);
@@ -552,8 +561,14 @@ async fn handle_project_connection(
         if n == 0 {
             return Ok(()); // EOF
         }
+        // Measure broker-internal handling time from request bytes received
+        // to response bytes about to be written. Audit `latency_ms` is the
+        // time inside the broker, not end-to-end including socket flush.
+        let start = Instant::now();
         let response_json = match serde_json::from_slice::<ProjectRequest>(&line) {
-            Ok(req) => dispatch_project(&server, &project, req),
+            Ok(req) => dispatch_project(&server, &project, req, peer_pid, peer_uid, start),
+            // Protocol errors are not "fetch attempts" — there's no parseable
+            // secret name to record — so no audit event is emitted here.
             Err(e) => serde_json::to_string(&ProjectError::new(
                 ProjectErrorCode::ProtocolError,
                 format!("malformed request: {e}"),
@@ -566,9 +581,18 @@ async fn handle_project_connection(
     }
 }
 
-fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) -> String {
+fn dispatch_project(
+    server: &Server,
+    project: &Project,
+    req: ProjectRequest,
+    peer_pid: Option<i32>,
+    peer_uid: Option<u32>,
+    start: Instant,
+) -> String {
     match req {
         ProjectRequest::Ping => {
+            // ping/info are not fetch attempts → no audit event (FR-013
+            // applies to `get` only).
             let resp = PingResponse::new(env!("CARGO_PKG_VERSION"), project.name.clone());
             serde_json::to_string(&resp).expect("PingResponse always serializes")
         }
@@ -586,6 +610,18 @@ fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) ->
             // FR-012: allowlist denial does not incur a backend round-trip
             // and does not consult the cache.
             if !manifest.allowlist.secrets.iter().any(|n| n == &name) {
+                emit_fetch(
+                    &server.audit,
+                    &project.name,
+                    &name,
+                    Decision::Deny,
+                    Outcome::Ok,
+                    peer_pid,
+                    peer_uid,
+                    start,
+                    None,
+                    Some("allowlist"),
+                );
                 return serde_json::to_string(&ProjectError::new(
                     ProjectErrorCode::Denied,
                     format!("Secret {name:?} is not in this project's allowlist."),
@@ -598,6 +634,18 @@ fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) ->
             // and it's immediately handed to `serde_json` to write to the
             // socket.
             if let Some(hit) = project.cache.get(&name) {
+                emit_fetch(
+                    &server.audit,
+                    &project.name,
+                    &name,
+                    Decision::Allow,
+                    Outcome::Ok,
+                    peer_pid,
+                    peer_uid,
+                    start,
+                    Some("cache"),
+                    None,
+                );
                 let resp = GetResponse::utf8(hit.value.expose_secret(), hit.ttl_seconds);
                 return serde_json::to_string(&resp).expect("GetResponse always serializes");
             }
@@ -605,6 +653,18 @@ fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) ->
             // `backend_error` placeholder. Once fnox-core lands, a
             // successful fetch will `project.cache.insert(name, value, None)`
             // before constructing the response.
+            emit_fetch(
+                &server.audit,
+                &project.name,
+                &name,
+                Decision::Allow,
+                Outcome::BackendError,
+                peer_pid,
+                peer_uid,
+                start,
+                None,
+                None,
+            );
             serde_json::to_string(&ProjectError::new(
                 ProjectErrorCode::BackendError,
                 "backend fetch not yet implemented in this build",
@@ -635,6 +695,38 @@ async fn drain_project_loops(server: &Arc<Server>, deadline: Instant) {
             }
         }
     }
+}
+
+/// Build and dispatch a `FetchEvent` audit record (FR-013, FR-017). The
+/// emission is fire-and-forget: `AuditWriter::record` queues onto a bounded
+/// channel and degrades to an in-memory ring buffer if the writer task can't
+/// keep up — it never blocks the calling fetch.
+#[allow(clippy::too_many_arguments)]
+fn emit_fetch(
+    audit: &AuditWriter,
+    project: &str,
+    secret_name: &str,
+    decision: Decision,
+    outcome: Outcome,
+    peer_pid: Option<i32>,
+    peer_uid: Option<u32>,
+    start: Instant,
+    backend: Option<&str>,
+    reason: Option<&str>,
+) {
+    let latency_ms = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+    audit.record(AuditEvent::Fetch(FetchEvent {
+        timestamp: OffsetDateTime::now_utc(),
+        project: project.to_string(),
+        secret_name: secret_name.to_string(),
+        decision,
+        outcome,
+        peer_pid,
+        peer_uid,
+        latency_ms,
+        backend: backend.map(str::to_string),
+        reason: reason.map(str::to_string),
+    }));
 }
 
 // -------------------------------------------------------------------------
@@ -1107,6 +1199,171 @@ mod tests {
         assert!(
             v.get("value").is_none(),
             "denied response must not leak a value"
+        );
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    /// Read every JSONL line in `path` (if it exists) and return them as
+    /// parsed `serde_json::Value`s. The audit writer is on its own task so
+    /// callers should poll via `wait_for_audit_events`.
+    fn read_audit_events(path: &Path) -> Vec<Value> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => s
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).expect("audit line must be valid JSON"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Poll until at least `min` events appear in the audit log. Returns the
+    /// final parsed list. Times out the test rather than hanging.
+    async fn wait_for_audit_events(path: &Path, min: usize) -> Vec<Value> {
+        for _ in 0..100 {
+            let events = read_audit_events(path);
+            if events.len() >= min {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "audit log never reached {min} events; have {:?}",
+            read_audit_events(path)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_emits_fetch_event_per_request() {
+        use secrecy::SecretString;
+
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let registry = server.registry();
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+
+        let project_socket = socket_dir.join("alpha.sock");
+
+        // Pre-warm cache so we can exercise the cache-hit audit branch.
+        let project = registry
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|p| p.name == "alpha")
+            .unwrap();
+        project
+            .cache
+            .insert("FOO".into(), SecretString::from("v1".to_string()), None);
+
+        // Three fetches: cache hit, denied, allowed-but-no-cache.
+        let _ = send_project(&project_socket, r#"{"op":"get","name":"FOO"}"#).await;
+        let _ = send_project(&project_socket, r#"{"op":"get","name":"BAR"}"#).await;
+        project.cache.clear();
+        let _ = send_project(&project_socket, r#"{"op":"get","name":"FOO"}"#).await;
+
+        // ping + info must NOT produce audit events.
+        let _ = send_project(&project_socket, r#"{"op":"ping"}"#).await;
+        let _ = send_project(&project_socket, r#"{"op":"info"}"#).await;
+
+        let events = wait_for_audit_events(&audit_log, 3).await;
+        // All three are Fetch events; ping/info contribute nothing.
+        assert_eq!(events.len(), 3, "expected 3 fetch events: {events:#?}");
+        for e in &events {
+            assert_eq!(e["event"], "fetch");
+            assert_eq!(e["project"], "alpha");
+            // peer_pid is the test process itself (server + client share
+            // a process in this test).
+            assert_eq!(
+                e["peer_pid"].as_i64(),
+                Some(std::process::id() as i64),
+                "peer_pid wrong: {e}"
+            );
+            // peer_uid varies across CI runners; just confirm it's recorded.
+            assert!(e["peer_uid"].is_u64(), "peer_uid missing: {e}");
+            assert!(e.get("latency_ms").is_some());
+            // SC-004: never a `value` field in audit events.
+            assert!(e.get("value").is_none(), "audit leaked value: {e}");
+        }
+
+        // Cache hit.
+        assert_eq!(events[0]["secret_name"], "FOO");
+        assert_eq!(events[0]["decision"], "allow");
+        assert_eq!(events[0]["outcome"], "ok");
+        assert_eq!(events[0]["backend"], "cache");
+        assert!(events[0].get("reason").is_none());
+
+        // Denied.
+        assert_eq!(events[1]["secret_name"], "BAR");
+        assert_eq!(events[1]["decision"], "deny");
+        assert_eq!(events[1]["outcome"], "ok");
+        assert_eq!(events[1]["reason"], "allowlist");
+        assert!(events[1].get("backend").is_none());
+
+        // Allowed but cache miss → backend stub.
+        assert_eq!(events[2]["secret_name"], "FOO");
+        assert_eq!(events[2]["decision"], "allow");
+        assert_eq!(events[2]["outcome"], "backend_error");
+        assert!(events[2].get("backend").is_none());
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn audit_never_contains_secret_value() {
+        // Tighter SC-004 check: pre-warm a cache entry with a distinctive
+        // secret string, exercise the cache-hit path, and grep the audit
+        // log for the substring.
+        use secrecy::SecretString;
+
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let registry = server.registry();
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+
+        let secret_value = "tripwire-DO-NOT-LEAK-7f3a";
+        let project = registry.snapshot().await.into_iter().next().unwrap();
+        project.cache.insert(
+            "FOO".into(),
+            SecretString::from(secret_value.to_string()),
+            None,
+        );
+
+        let project_socket = socket_dir.join("alpha.sock");
+        let resp = send_project(&project_socket, r#"{"op":"get","name":"FOO"}"#).await;
+        assert!(resp.contains(secret_value), "value must be in the response");
+
+        let _events = wait_for_audit_events(&audit_log, 1).await;
+        let log_contents = std::fs::read_to_string(&audit_log).unwrap();
+        assert!(
+            !log_contents.contains(secret_value),
+            "audit log contained the secret value: {log_contents}"
         );
 
         server_handle.abort();
