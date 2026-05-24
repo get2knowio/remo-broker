@@ -3,7 +3,7 @@
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
 **Status**: In Progress
-**Last Updated**: 2026-05-24 (commit `8fd1afd`)
+**Last Updated**: 2026-05-24 (commit `bf3f1c8`; 125 tests passing, clippy + cargo deny green)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
 
 ## Implementation Status
@@ -46,7 +46,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | ID | Status | Notes |
 |---|---|---|
 | NFR-001 | Unverified | Cache lookup is `Mutex::lock` + `HashMap::get` + a single `String::clone` for the value — comfortably ≤5 ms p99 on any modern Linux box, but no harness yet. Lands with the SC-002 soak. |
-| NFR-002 | Pending | No backend round-trip path yet. |
+| NFR-002 | Unverified | Backend path exists via `BackendSession::get`; no cold-latency harness yet. The broker-overhead budget (≤20 ms) is small compared with realistic backend RTTs (AWS Secrets Manager ~50–200 ms), so the headroom is plausible — but unmeasured. Lands with the SC-002 soak / a dedicated cold-fetch benchmark. |
 | NFR-003 | Unverified | No startup-time benchmark; daemon currently starts in well under 500 ms on a dev box but unmeasured. |
 | NFR-004 | Unverified | No idle-RSS measurement; release-build footprint unmeasured. |
 | NFR-005 | Unverified | No musl/release-build size check yet. |
@@ -62,7 +62,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | SC-003 | Pending | No killtest harness yet. |
 | SC-004 | Done (for the audit-log half) | Structural guarantee in `src/audit.rs` plus the runtime check in `audit_never_contains_secret_value` — plants a distinctive tripwire value, drives a cache hit, greps the on-disk audit log. The "daemon stdout/stderr" half of SC-004 still relies on the broader integration harness. |
 | SC-005 | Pending | No red-team harness yet. FR-007/012 are now in place (allowlist denial is wired and reaches no backend), so the harness can be built; the brute-force-name and cross-project escalation cases are the remaining gaps. |
-| SC-006 | Pending | Cross-repo CI depends on the Remo Python codebase and fnox-core landing. |
+| SC-006 | Pending | fnox-core has landed (commit `8fd1afd`), so the broker side of the integration is ready. Still pending: the Remo Python codebase's matching code path, the cross-repo CI plumbing, and a hermetic `fnox.toml` fixture (the local-file provider is the obvious candidate for CI hermeticity). |
 
 ### External Dependencies
 
@@ -118,13 +118,14 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 
 Items the spec calls for that we've consciously postponed, in roughly the order we plan to tackle them. This list is exhaustive against the requirements above — anything not yet "Done" appears here.
 
-1. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
+1. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007. **Packaging note**: fnox-core's transitive `hidapi` dep dynamically links `libudev0` — production hosts need it installed (almost always already present, since `systemd` depends on it). The eventual `.deb` should declare `Depends: libudev1` (or whatever the target distro names it).
 2. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
 3. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python). SC-005 can now exercise the real backend path now that fnox-core is wired; the others remain infrastructure work.
 4. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target). NFR-005's static-link goal may be in tension with libudev's dynamic link from `ctap-hid-fido2` → `hidapi`; first measurement will tell us.
 5. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted. Note that peer_pid/peer_uid are *recorded* in audit events as of `469e551` — the open question is what to *enforce*.
 6. **End-to-end test against a real fnox-core session** (User Story 1 acceptance scenarios; SC-006). Needs a fixture `fnox.toml` and at least one provider that's hermetic in CI (the local-file provider is the obvious candidate). Unblocked by the fnox-core integration.
-7. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+7. **`cargo-deny` ignore-list review cadence**. The six advisories in `deny.toml` should be re-evaluated on every dep bump and at least quarterly. Worth a short script (or a `cargo deny check` job that lists ignored advisories so they're visible in CI logs) so they don't quietly become permanent.
+8. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
 
 **Resolved open questions**:
 
