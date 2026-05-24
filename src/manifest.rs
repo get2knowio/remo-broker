@@ -95,8 +95,13 @@ pub struct Cache {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawManifest {
+    /// Manifest schema version. Must equal 1; the broker rejects
+    /// other values with a clear error so old/new clients see a
+    /// targeted failure rather than a partial parse.
+    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 1)))]
     schema_version: u32,
     project: RawProject,
     allowlist: RawAllowlist,
@@ -105,23 +110,73 @@ struct RawManifest {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawProject {
+    /// Project identifier. Must match `^[a-z0-9][a-z0-9_-]{0,63}$`
+    /// and the project directory's basename.
+    #[cfg_attr(
+        feature = "schema-gen",
+        schemars(regex(pattern = r"^[a-z0-9][a-z0-9_-]{0,63}$"))
+    )]
     name: String,
+    /// Optional free-form description; surfaced in audit logs and
+    /// status output.
+    #[cfg_attr(feature = "schema-gen", schemars(length(max = 256)))]
     description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawAllowlist {
+    /// Secret names this project is allowed to fetch. Each entry
+    /// must match `^[A-Za-z0-9_]{1,128}$`. Duplicates are rejected
+    /// at validation time (no JSON Schema construct for that here —
+    /// the broker enforces it).
+    #[cfg_attr(
+        feature = "schema-gen",
+        schemars(length(min = 0), inner(regex(pattern = r"^[A-Za-z0-9_]{1,128}$")))
+    )]
     secrets: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 struct RawCache {
+    /// Per-project cache TTL. Caps the broker-wide default
+    /// downward; the broker rejects values above its configured
+    /// default to prevent a permissive manifest from raising the
+    /// secret exposure window.
+    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 86400)))]
     ttl_seconds: Option<u32>,
+    /// Per-project maximum cache entries. Same downward-cap rule.
+    #[cfg_attr(feature = "schema-gen", schemars(range(min = 1, max = 1024)))]
     max_entries: Option<u32>,
+}
+
+/// JSON Schema for the v1 manifest, used to publish
+/// `schema/remo-broker.v1.json` for downstream client validation
+/// (Remo pins to this artifact per the compatibility commitments
+/// in `docs/manifest-schema.md`).
+#[cfg(feature = "schema-gen")]
+pub fn manifest_json_schema() -> schemars::schema::RootSchema {
+    let mut schema = schemars::schema_for!(RawManifest);
+    let meta = &mut schema.schema.metadata().clone();
+    meta.title = Some("remo-broker.toml (v1)".to_owned());
+    meta.description = Some(
+        "Per-project manifest declaring the broker's allowlist and \
+         optional cache overrides. Source of truth: \
+         docs/manifest-schema.md in the get2knowio/remo-broker repo. \
+         Validation beyond what this schema expresses (project.name \
+         matching the directory basename, allowlist.secrets uniqueness, \
+         cache values not exceeding broker-wide defaults) is enforced \
+         server-side at register time."
+            .to_owned(),
+    );
+    schema.schema.metadata = Some(meta.clone().into());
+    schema
 }
 
 impl Manifest {
@@ -512,6 +567,49 @@ secrets = []
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Snapshot test for the published JSON Schema. Runs only with
+    /// `--features schema-gen` (CI invokes it there). When the
+    /// committed artifact is stale this test fails with a diff and
+    /// the regenerated file written to `<tempdir>/regenerated.json`;
+    /// the fix is to copy the regenerated content over the committed
+    /// `schema/remo-broker.v1.json` and commit the result.
+    #[cfg(feature = "schema-gen")]
+    #[test]
+    fn manifest_json_schema_matches_published_artifact() {
+        let committed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("schema")
+            .join("remo-broker.v1.json");
+
+        let regenerated = serde_json::to_string_pretty(&manifest_json_schema()).unwrap() + "\n";
+
+        let committed = match std::fs::read_to_string(&committed_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(committed_path.parent().unwrap()).unwrap();
+                std::fs::write(&committed_path, &regenerated).unwrap();
+                panic!(
+                    "schema artifact was missing; wrote a fresh one to {}. \
+                     Commit it and re-run the test.",
+                    committed_path.display()
+                );
+            }
+            Err(e) => panic!("failed to read {}: {e}", committed_path.display()),
+        };
+
+        if committed != regenerated {
+            let dir = tempdir();
+            let out = dir.path().join("regenerated.json");
+            std::fs::write(&out, &regenerated).unwrap();
+            panic!(
+                "JSON Schema drift detected.\n\
+                 Committed artifact: {}\n\
+                 Regenerated (please copy over): {}\n",
+                committed_path.display(),
+                out.display()
+            );
         }
     }
 }

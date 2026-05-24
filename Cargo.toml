@@ -35,6 +35,16 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# JSON Schema artifact generation (FR-010 / manifest-schema.md
+# "Compatibility commitments"). Off by default so the production
+# binary doesn't link schemars; enabled in CI to regenerate +
+# snapshot-test `schema/remo-broker.v1.json`.
+schemars = { version = "0.8", optional = true }
+
+[features]
+default = []
+schema-gen = ["dep:schemars"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

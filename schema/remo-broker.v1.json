@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "remo-broker.toml (v1)",
+  "description": "Per-project manifest declaring the broker's allowlist and optional cache overrides. Source of truth: docs/manifest-schema.md in the get2knowio/remo-broker repo. Validation beyond what this schema expresses (project.name matching the directory basename, allowlist.secrets uniqueness, cache values not exceeding broker-wide defaults) is enforced server-side at register time.",
+  "type": "object",
+  "required": [
+    "allowlist",
+    "project",
+    "schema_version"
+  ],
+  "properties": {
+    "allowlist": {
+      "$ref": "#/definitions/RawAllowlist"
+    },
+    "cache": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RawCache"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "project": {
+      "$ref": "#/definitions/RawProject"
+    },
+    "schema_version": {
+      "description": "Manifest schema version. Must equal 1; the broker rejects other values with a clear error so old/new clients see a targeted failure rather than a partial parse.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 1.0,
+      "minimum": 1.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "RawAllowlist": {
+      "type": "object",
+      "required": [
+        "secrets"
+      ],
+      "properties": {
+        "secrets": {
+          "description": "Secret names this project is allowed to fetch. Each entry must match `^[A-Za-z0-9_]{1,128}$`. Duplicates are rejected at validation time (no JSON Schema construct for that here — the broker enforces it).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_]{1,128}$"
+          },
+          "minItems": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RawCache": {
+      "type": "object",
+      "properties": {
+        "max_entries": {
+          "description": "Per-project maximum cache entries. Same downward-cap rule.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 1024.0,
+          "minimum": 1.0
+        },
+        "ttl_seconds": {
+          "description": "Per-project cache TTL. Caps the broker-wide default downward; the broker rejects values above its configured default to prevent a permissive manifest from raising the secret exposure window.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 86400.0,
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RawProject": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Optional free-form description; surfaced in audit logs and status output.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "name": {
+          "description": "Project identifier. Must match `^[a-z0-9][a-z0-9_-]{0,63}$` and the project directory's basename.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
