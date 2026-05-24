@@ -3,7 +3,7 @@
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
 **Status**: In Progress
-**Last Updated**: 2026-05-24 (commit `67ed104`)
+**Last Updated**: 2026-05-24 (commit `469e551`)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
 
 ## Implementation Status
@@ -28,11 +28,11 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | FR-010 | Done | `src/manifest.rs` parses + validates per `docs/manifest-schema.md`; `dispatch_register` invokes `Manifest::load` before binding, surfacing `manifest_invalid` / `manifest_not_found` on failure. |
 | FR-011 | Done | `Project.manifest` is `ArcSwap<Manifest>`; `reload` swaps atomically. `reload_propagates_new_allowlist` confirms in-flight project-socket connections see the new allowlist on the next op without a teardown. |
 | FR-012 | Done | `dispatch_project` checks the project's `ArcSwap` allowlist before doing any backend work; off-allowlist returns `denied` with no backend hit. The actual backend fetch still stubs `backend_error` pending fnox-core. |
-| FR-013 | Pending | Audit writer ready in `src/audit.rs`; emission on each fetch attempt lands with the fetch path. |
+| FR-013 | Done | `dispatch_project::Get` emits a `FetchEvent` on each of its three branches (denied/cache-hit/backend-stub) via the `emit_fetch` helper. `ping`/`info` and protocol errors don't emit (not fetch attempts). Tests: `get_emits_fetch_event_per_request`. |
 | FR-014 | Done | `src/cache.rs::BoundedCache` (per-`Project`) caches successful retrievals with TTL + max-entries from the manifest's `[cache]` block (falling back to `cache_default_*` from `Config`). Lazy expiry on `get`; oldest-by-`fetched_at` eviction at cap. Cache hit short-circuits the backend in `dispatch_project::Get`. |
 | FR-015 | Done | `BoundedCache` is `Mutex<HashMap<…>>` on the heap — nothing on the cache path touches disk. The audit log is the only file the daemon writes to during request handling, and it never contains values (FR-017). |
 | FR-016 | Partial | `BoundedCache` values are `secrecy::SecretString` (placeholder for fnox-core's `SecretBox`), which zeroizes on drop. Eviction / replacement / `clear` / `unregister` (project Arc dropped → cache dropped → values dropped) all trigger zeroization. Final swap to `SecretBox` lands with FR-004. |
-| FR-017 | Partial | Event types + async writer + degraded-mode buffer done in `src/audit.rs`; per-fetch emission pending FR-013. |
+| FR-017 | Done | `FetchEvent` carries timestamp, project, secret_name, decision, outcome, peer_pid (`SO_PEERCRED`), peer_uid, latency_ms, optional backend, optional reason. Values are not in any audit event by construction — the event types simply have no `value` field. |
 | FR-018 | Done | Bounded channel + in-memory degraded buffer; tests confirm a wedged file write does not block producers. |
 | FR-019 | Partial | All wire types complete in `src/proto/`; admin `register`/`unregister`/`reload`/`status` and project `ping`/`info` handle end-to-end. `get` returns `backend_error` (allowlist denial returns `denied`); `rotate-bootstrap` still stubs `internal_error`. |
 | FR-020 | Done | Admin `status` and project `ping` both advertise `broker_version` + `protocol_version`. |
@@ -60,7 +60,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | SC-001 | Pending | No fuzz harness against the NDJSON parser yet. |
 | SC-002 | Pending | No soak harness yet. |
 | SC-003 | Pending | No killtest harness yet. |
-| SC-004 | Partial | Structural guarantee in `src/audit.rs` (event types cannot carry values; `fetch_event_does_not_serialize_a_value_field` test pins it). Full integration grep pending the end-to-end harness. |
+| SC-004 | Done (for the audit-log half) | Structural guarantee in `src/audit.rs` plus the runtime check in `audit_never_contains_secret_value` — plants a distinctive tripwire value, drives a cache hit, greps the on-disk audit log. The "daemon stdout/stderr" half of SC-004 still relies on the broader integration harness. |
 | SC-005 | Pending | No red-team harness yet. FR-007/012 are now in place (allowlist denial is wired and reaches no backend), so the harness can be built; the brute-force-name and cross-project escalation cases are the remaining gaps. |
 | SC-006 | Pending | Cross-repo CI depends on the Remo Python codebase and fnox-core landing. |
 
@@ -100,6 +100,9 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 | `BoundedCache` is `Mutex<HashMap>` per project, not a global cache keyed on `(project, name)`. | Per-project lock keeps the contention domain small and lines up with `unregister` semantics: dropping the project Arc drops the cache, which zeroizes every entry — no separate "drop entries for project X" pass. | `src/cache.rs` |
 | Cache eviction: drop oldest by `fetched_at` (LRU-on-write); resolves OQ-3. | Strict LRU would require write-locking on every read to update access time. We expect reads to vastly outnumber writes, so we keep reads lock-light and let writes bear the eviction cost. | `src/cache.rs::evict_oldest` |
 | `BoundedCache::set_config` does not actively shrink to fit a smaller cap. | Synchronously shrinking on reload would briefly hold the cache lock across an arbitrary number of evictions. New inserts will drift the size down naturally, and the size never *exceeds* the cap by more than `(old_cap - new_cap)`. | `src/cache.rs::set_config` |
+| Audit `latency_ms` measures broker-internal handling time (request bytes received → response bytes about to be written), not end-to-end including socket flush. | The broker's own latency is what's useful for operations; socket flush is dominated by the kernel and the peer, neither of which the broker controls. | `src/server.rs::handle_project_connection` |
+| `emit_fetch` is called **before** the response is serialized, so a slow / wedged socket write doesn't lose the audit record. | The audit record is the security artifact; the response is the user-facing artifact. If we have to choose between losing one, lose the response. (In practice `AuditWriter::record` is a `try_send` returning in microseconds, so the choice is mostly theoretical.) | `src/server.rs::dispatch_project` |
+| `ping` / `info` / protocol errors do not emit audit events. | FR-013 says "every fetch attempt"; non-fetch ops and unparseable requests aren't fetches. A protocol error has no secret name to record. Auditing ping/info would just add noise an operator has to filter through. | `src/server.rs::dispatch_project` |
 | Drain on SIGTERM **and** SIGINT. | Ctrl-C during dev produces the same clean shutdown systemd would. | `src/server.rs::install_sigterm` |
 | Tests use hand-rolled RAII tempdir helpers; no `tempfile` crate dependency. | Helpers are ~15 LoC per module; avoids pulling in a transitive dep just for tests. | every `mod tests` |
 | Tests that mutate env use unique per-test variable names. | `std::env::set_var` is `unsafe` in edition 2024; unique names avoid cross-test races without serializing. | `src/bootstrap.rs::tests` |
@@ -109,22 +112,21 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 
 Items the spec calls for that we've consciously postponed, in roughly the order we plan to tackle them. This list is exhaustive against the requirements above — anything not yet "Done" appears here.
 
-1. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox` in `BootstrapToken` and `BoundedCache`; wire up the actual backend fetch in `dispatch_project::Get` where `backend_error` is currently stubbed. The cache infrastructure is already in place and will be populated by the new fetch path.
-2. **Per-fetch audit emission** (FR-013, the emission half of FR-017). Connect the fetch path (allow/deny + cache-hit/backend-hit outcome) into the existing `AuditWriter`. SO_PEERCRED lookups for peer_pid / peer_uid land here too.
-3. **IMDSv2 bootstrap source** (FR-002b). Small HTTP client against `169.254.169.254`; mocked metadata endpoint in tests.
-4. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core. Currently the only admin op still stubbing `internal_error`.
-5. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
-6. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
-7. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
-8. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
-9. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted.
-10. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+1. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox` in `BootstrapToken` and `BoundedCache`; wire up the actual backend fetch in `dispatch_project::Get` where `backend_error` is currently stubbed. The cache + audit emission machinery is already in place and will start carrying real values + `Outcome::Ok` audit records the moment a fetch returns a value.
+2. **IMDSv2 bootstrap source** (FR-002b). Small HTTP client against `169.254.169.254`; mocked metadata endpoint in tests.
+3. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core. Currently the only admin op still stubbing `internal_error`.
+4. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
+5. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
+6. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
+7. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
+8. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted. Note that peer_pid/peer_uid are *recorded* in audit events as of `469e551` — the open question is what to *enforce*.
+9. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
 
 **Resolved open questions**:
 
 - **OQ-3** (LRU vs bounded cache): Resolved as **bounded with FIFO-by-write eviction** (drop oldest by `fetched_at`). Strict LRU would require write-locking on every read to update access time; we keep reads lock-light. See `src/cache.rs` module docs.
 
-**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020) — commit `7ef64d9`. Per-project bounded cache with zeroize-on-drop wired into the `get` path (FR-014/015 + most of FR-016) — commit `67ed104`.
+**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020) — commit `7ef64d9`. Per-project bounded cache with zeroize-on-drop wired into the `get` path (FR-014/015 + most of FR-016) — commit `67ed104`. Per-fetch audit emission with `SO_PEERCRED` (FR-013, FR-017, and the audit-log half of SC-004) — commit `469e551`.
 
 ## Background and Motivation
 
