@@ -3,7 +3,7 @@
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
 **Status**: In Progress
-**Last Updated**: 2026-05-24 (commit `c3f27fb`)
+**Last Updated**: 2026-05-24 (commit `8fd1afd`)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
 
 ## Implementation Status
@@ -19,22 +19,22 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | FR-001 | Done | `src/config.rs` parses `/etc/remo-broker/config.toml` strict-mode with CLI-override precedence (CLI > file > default). |
 | FR-002 | Done | `file`, `env`, and `imds` sources all implemented in `src/bootstrap.rs`. IMDS does PUT-token → GET-role → GET-credentials over a hand-rolled HTTP/1.1 client on `tokio::net::TcpStream`; structured error variants for the various failure modes. Exercised by an in-process `MockImds` (happy path + 500 + empty role list + empty token body + connection refused). |
 | FR-003 | Done | `src/main.rs` prints to stderr and exits non-zero when no bootstrap source yields a usable token. |
-| FR-004 | Pending | `fnox-core` dependency not yet added; broker has no backend retrieval code. |
-| FR-005 | Pending | Depends on FR-004. |
+| FR-004 | Done | `src/backend.rs::BackendSession` is the one named call site for `fnox_core::*`. `dispatch_project::Get` cache-miss goes to `backend.get(name).await`; no backend-specific (1Password/Vault/AWS/age/keychain) code lives outside fnox-core. |
+| FR-005 | Done | Single `BackendSession` constructed in `main.rs` (`Fnox::open(path)` if `--fnox-config` is set, else `Fnox::discover()`), passed to `Server::new`, shared across every handler via the wrapped `Arc<ArcSwap<Fnox>>`. `rotate-bootstrap` swaps the inner `Arc<Fnox>` atomically; in-flight `get` calls complete against the snapshot they loaded. |
 | FR-006 | Done | `src/server.rs::ensure_socket_dir` + `bind_admin_socket` create `socket_dir` (0755) and `admin.sock` (0600). |
 | FR-007 | Done | `src/registry.rs::bind_project_socket` binds `<socket_dir>/<name>.sock` (mode 0660) on admin `register`. Group-ownership configuration still TBD with the systemd unit (FR-023). |
 | FR-008 | Done | Admin socket removed on shutdown; project sockets removed on `unregister` and again on shutdown after their accept loops drain. |
 | FR-009 | Done | `bind_admin_socket` + `bind_project_socket` both remove stale files before binding; covered by `stale_admin_socket_is_replaced_on_bind` and `register_replaces_stale_socket_file`. |
 | FR-010 | Done | `src/manifest.rs` parses + validates per `docs/manifest-schema.md`; `dispatch_register` invokes `Manifest::load` before binding, surfacing `manifest_invalid` / `manifest_not_found` on failure. |
 | FR-011 | Done | `Project.manifest` is `ArcSwap<Manifest>`; `reload` swaps atomically. `reload_propagates_new_allowlist` confirms in-flight project-socket connections see the new allowlist on the next op without a teardown. |
-| FR-012 | Done | `dispatch_project` checks the project's `ArcSwap` allowlist before doing any backend work; off-allowlist returns `denied` with no backend hit. The actual backend fetch still stubs `backend_error` pending fnox-core. |
+| FR-012 | Done | `dispatch_get` checks the project's `ArcSwap` allowlist *before* the cache lookup or `backend.get` call; off-allowlist returns `denied` with no backend hit, no cache touch, audit `decision=deny, reason=allowlist`. |
 | FR-013 | Done | `dispatch_project::Get` emits a `FetchEvent` on each of its three branches (denied/cache-hit/backend-stub) via the `emit_fetch` helper. `ping`/`info` and protocol errors don't emit (not fetch attempts). Tests: `get_emits_fetch_event_per_request`. |
 | FR-014 | Done | `src/cache.rs::BoundedCache` (per-`Project`) caches successful retrievals with TTL + max-entries from the manifest's `[cache]` block (falling back to `cache_default_*` from `Config`). Lazy expiry on `get`; oldest-by-`fetched_at` eviction at cap. Cache hit short-circuits the backend in `dispatch_project::Get`. |
 | FR-015 | Done | `BoundedCache` is `Mutex<HashMap<…>>` on the heap — nothing on the cache path touches disk. The audit log is the only file the daemon writes to during request handling, and it never contains values (FR-017). |
-| FR-016 | Partial | `BoundedCache` values are `secrecy::SecretString` (placeholder for fnox-core's `SecretBox`), which zeroizes on drop. Eviction / replacement / `clear` / `unregister` (project Arc dropped → cache dropped → values dropped) all trigger zeroization. Final swap to `SecretBox` lands with FR-004. |
+| FR-016 | Done | `BoundedCache` values stay in `secrecy::SecretString` (zeroizes on drop) for the cache's lifetime. fnox-core returns plain `String` from `Fnox::get` — we wrap into `SecretString` immediately in `dispatch_get` before cache insert; the plaintext `String` lives only inside the request-scoped local and is dropped after the response is serialized. Eviction / replacement / `clear` / `unregister` all trigger the cache zeroization path. |
 | FR-017 | Done | `FetchEvent` carries timestamp, project, secret_name, decision, outcome, peer_pid (`SO_PEERCRED`), peer_uid, latency_ms, optional backend, optional reason. Values are not in any audit event by construction — the event types simply have no `value` field. |
 | FR-018 | Done | Bounded channel + in-memory degraded buffer; tests confirm a wedged file write does not block producers. |
-| FR-019 | Partial | All wire types complete in `src/proto/`; admin `register`/`unregister`/`reload`/`status` and project `ping`/`info` handle end-to-end. `get` returns `backend_error` (allowlist denial returns `denied`); `rotate-bootstrap` still stubs `internal_error`. |
+| FR-019 | Done | All wire types in `src/proto/` are wired end-to-end. Admin: `register`/`unregister`/`reload`/`status`/`rotate-bootstrap`. Project: `ping`/`info`/`get` with full `denied` / `not_found` / `backend_error` / `ok` paths. |
 | FR-020 | Done | Admin `status` and project `ping` both advertise `broker_version` + `protocol_version`. |
 | FR-021 | Done | `sd_notify_ready()` is called after the admin socket binds; no-op outside systemd. |
 | FR-022 | Done | `install_sigterm` (SIGTERM + SIGINT) + `SHUTDOWN_DRAIN = 5s` + `drain_join_set`. |
@@ -51,7 +51,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | NFR-004 | Unverified | No idle-RSS measurement; release-build footprint unmeasured. |
 | NFR-005 | Unverified | No musl/release-build size check yet. |
 | NFR-006 | Done | `rust-toolchain.toml` pins stable; `Cargo.toml` `rust-version = "1.95"`. |
-| NFR-007 | Done | `.github/workflows/ci.yml` runs fmt + `clippy --all-targets -- -D warnings` + test + `cargo audit` + `cargo deny`. |
+| NFR-007 | Done | `.github/workflows/ci.yml` runs fmt + `clippy --all-targets -- -D warnings` + test + `cargo audit` + `cargo deny`. fnox-core's transitive dep tree introduces six known RUSTSEC advisories (atty/rustls-pemfile unmaintained; rsa Marvin Attack; three webpki cert-validation issues) bounded to outbound AWS TLS; all are documented and ignored in `deny.toml` with per-entry rationales and mirrored into the rustsec/audit-check action's `ignore` input. Revisit on every dep bump. |
 
 ### Success criteria
 
@@ -70,7 +70,7 @@ Open external decisions that gate forward progress.
 
 | Dependency | State | Blocks |
 |---|---|---|
-| `fnox-core` source/version | Not chosen. Options: crates.io vs git vs local path. | FR-004, FR-005, the real form of FR-016 (currently `secrecy::SecretString` placeholder), the cache implementation, the fetch path, the `rotate-bootstrap` admin op, User Story 6 (multi-backend). |
+| ~~`fnox-core` source/version~~ | **Decided**: `fnox-core = "1.25"` from crates.io (jdx/fnox project). Integrated in commit `8fd1afd`. The integration is wrapped behind `src/backend.rs::BackendSession` (Arc<ArcSwap<Fnox>>) so it remains the single named call site for fnox-core symbols. | — |
 | ~~IMDSv2 HTTP client~~ | **Decided**: hand-rolled HTTP/1.1 over `tokio::net::TcpStream`. Three requests against plain-HTTP `169.254.169.254`; pulling in a 500 KB+ HTTP client crate would be disproportionate. ~50 LoC of parse logic, fully unit-tested. | — |
 | ~~Mocked metadata endpoint for IMDS tests~~ | **Decided**: in-process `MockImds` test helper in `src/bootstrap.rs::tests` binds `127.0.0.1:0`, accepts N connections, dispatches on path. No external test fixture needed. | — |
 
@@ -80,7 +80,7 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 
 | Decision | Rationale | Location |
 |---|---|---|
-| Use `secrecy::SecretString` as a placeholder for fnox-core's `SecretBox`. | Lets us implement zeroize-on-drop and `Debug` redaction today; swap will be a single type-alias when fnox-core lands. | `src/bootstrap.rs` |
+| Cache values stay in `secrecy::SecretString`; fnox-core's `Fnox::get` returns plain `String`. | fnox-core does not expose its own secret-wrapper type publicly — `get -> Result<Option<String>>` is the API. We wrap the returned `String` into `SecretString` at the boundary (`dispatch_get`), keep it in `SecretString` for the cache lifetime, and `expose_secret()` only when constructing the outgoing `GetResponse`. The plaintext window is one request-scoped `String` per cold fetch. | `src/server.rs::dispatch_get`, `src/backend.rs`, `src/cache.rs` |
 | Audit log uses open-per-write `O_APPEND`. | Spec explicitly endorses it ("no SIGHUP required if using O_APPEND + open-per-write"); makes log rotation transparent; per-write open cost is ~2.5 % of writer-task CPU at SC-002 load. | `src/audit.rs::AuditFile` |
 | Library crate (`src/lib.rs`) + thin binary (`src/main.rs`). | Modules don't need a binary consumer to satisfy dead-code analysis; tests target the library. | `src/lib.rs`, `src/main.rs` |
 | Wire-protocol requests intentionally do **not** set `deny_unknown_fields`. | wire-protocol.md §4 mandates v1 brokers tolerate additive fields from v1.x clients. | `src/proto/{project,admin}.rs` |
@@ -106,6 +106,9 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 | Hand-rolled HTTP/1.1 client for IMDSv2 instead of an HTTP-client crate. | Three requests against a plain-HTTP link-local endpoint don't justify a 500 KB+ dependency. Hand-rolled is ~50 LoC of parse logic and avoids transitive license / audit-surface concerns. If we ever need TLS or HTTP/2 we'll reach for `hyper`. | `src/bootstrap.rs` |
 | IMDS credentials JSON is wrapped *verbatim* in `BootstrapToken` (a `SecretString`) rather than parsed into typed fields. | The broker doesn't itself use the AWS credentials — fnox-core does. Keeping the blob opaque means we don't have to track AWS-credential schema drift, and the eventual swap to `fnox_core::SecretBox` is a one-line change. | `src/bootstrap.rs::fetch_imds_at` |
 | Per-call IMDS timeout is 2 s. | The metadata service is link-local and usually answers in milliseconds; longer means we're not actually on EC2 and should fail fast rather than wedge `READY=1`. | `src/bootstrap.rs::IMDS_TIMEOUT` |
+| Backend wrapper holds `Arc<ArcSwap<Fnox>>`, even though `Fnox` is internally `Arc`. | We need atomic swap on `rotate-bootstrap`. `ArcSwap` gives wait-free reads from handlers and consistent observation: handlers `load_full()` once at the start of a fetch; any concurrent `replace`/`adopt` from `rotate-bootstrap` is seen by the next fetch, not the in-flight one. | `src/backend.rs` |
+| Daemon starts in degraded mode if no fnox-core session can be built (no `--fnox-config`, no discoverable `fnox.toml`). | Keeps admin/ping/info/cache-hit traffic working so operators can `status`-check and observe. `get` cache-miss + `rotate-bootstrap` surface targeted errors mentioning `--fnox-config`. An explicit `--fnox-config /typo` is the exception — that's a hard error (parallel to `Config::load(Some(p))`). | `src/main.rs`, `src/server.rs` |
+| Six RUSTSEC advisories from fnox-core's transitive AWS-SDK / hyper / rustls deps are accepted and documented in `deny.toml`. | The alternative (no fnox-core) is to reimplement multi-backend secret retrieval ourselves, which is the entire point of fnox-core. The advisories are bounded to TLS validation of AWS-controlled endpoints; the ignore list is the audit trail. | `deny.toml`, `.github/workflows/ci.yml` |
 | Drain on SIGTERM **and** SIGINT. | Ctrl-C during dev produces the same clean shutdown systemd would. | `src/server.rs::install_sigterm` |
 | Tests use hand-rolled RAII tempdir helpers; no `tempfile` crate dependency. | Helpers are ~15 LoC per module; avoids pulling in a transitive dep just for tests. | every `mod tests` |
 | Tests that mutate env use unique per-test variable names. | `std::env::set_var` is `unsafe` in edition 2024; unique names avoid cross-test races without serializing. | `src/bootstrap.rs::tests` |
@@ -115,21 +118,20 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 
 Items the spec calls for that we've consciously postponed, in roughly the order we plan to tackle them. This list is exhaustive against the requirements above — anything not yet "Done" appears here.
 
-1. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox` in `BootstrapToken` and `BoundedCache`; wire up the actual backend fetch in `dispatch_project::Get` where `backend_error` is currently stubbed. The bootstrap-token resolver (file/env/imds), cache, and audit emission machinery are all in place and will start carrying real values + `Outcome::Ok` audit records the moment a fetch returns a value.
-2. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core. Currently the only admin op still stubbing `internal_error`.
-3. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
-4. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
-5. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
-6. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
-7. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted. Note that peer_pid/peer_uid are *recorded* in audit events as of `469e551` — the open question is what to *enforce*.
-8. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+1. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
+2. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
+3. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python). SC-005 can now exercise the real backend path now that fnox-core is wired; the others remain infrastructure work.
+4. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target). NFR-005's static-link goal may be in tension with libudev's dynamic link from `ctap-hid-fido2` → `hidapi`; first measurement will tell us.
+5. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted. Note that peer_pid/peer_uid are *recorded* in audit events as of `469e551` — the open question is what to *enforce*.
+6. **End-to-end test against a real fnox-core session** (User Story 1 acceptance scenarios; SC-006). Needs a fixture `fnox.toml` and at least one provider that's hermetic in CI (the local-file provider is the obvious candidate). Unblocked by the fnox-core integration.
+7. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
 
 **Resolved open questions**:
 
 - **OQ-2** (IMDS refresh): Resolved as **no auto-refresh in the broker**. fnox-core will handle AWS credential rotation internally. Confirmed by the IMDS implementation in commit `c3f27fb`: `fetch_imds_at` is called once at startup and once on `rotate-bootstrap`; the daemon never schedules its own refresh.
 - **OQ-3** (LRU vs bounded cache): Resolved as **bounded with FIFO-by-write eviction** (drop oldest by `fetched_at`). Strict LRU would require write-locking on every read to update access time; we keep reads lock-light. See `src/cache.rs` module docs.
 
-**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020) — commit `7ef64d9`. Per-project bounded cache with zeroize-on-drop wired into the `get` path (FR-014/015 + most of FR-016) — commit `67ed104`. Per-fetch audit emission with `SO_PEERCRED` (FR-013, FR-017, and the audit-log half of SC-004) — commit `469e551`. IMDSv2 bootstrap source with structured errors + in-process mock metadata endpoint (FR-002b, the rest of FR-002) — commit `c3f27fb`.
+**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020) — commit `7ef64d9`. Per-project bounded cache with zeroize-on-drop wired into the `get` path (FR-014/015 + most of FR-016) — commit `67ed104`. Per-fetch audit emission with `SO_PEERCRED` (FR-013, FR-017, and the audit-log half of SC-004) — commit `469e551`. IMDSv2 bootstrap source with structured errors + in-process mock metadata endpoint (FR-002b, the rest of FR-002) — commit `c3f27fb`. fnox-core integration: `BackendSession` wrapper, `dispatch_project::Get` cache-miss → fnox `get`, `rotate-bootstrap` admin op with atomic ArcSwap, FR-016 final form, all of User Story 6's multi-backend transparency claim (the broker carries no backend-specific code; fnox-core's provider config selects between 1Password/Vault/AWS/age/keychain) — commit `8fd1afd`.
 
 ## Background and Motivation
 
