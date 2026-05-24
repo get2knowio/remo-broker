@@ -132,3 +132,78 @@ cargo bloat --release --crates -n 25
 
 Re-run after any dep bump that touches fnox-core or any of the top-10
 crates, and re-commit this file.
+
+## Attribution: what an upstream `fnox-core` feature-flag PR would unlock
+
+This section quantifies the upstream-ticket pitch. It's based on a
+manual attribution of the top-100 crates against `cargo tree -i` walks
+from each candidate-for-removal crate; numbers are conservative
+(direct + clearly-attributable transitives only). The actual savings
+in a real built binary would be *higher* than the sum below because
+dead-code elimination during link-time optimization also drops
+unreached generic monomorphizations (the `[Unknown]` row that
+contributes 1.8 MiB to `.text` today).
+
+### Scenario: "Minimal Remo install" — AWS + age + plain only
+
+This is the leanest realistic profile: a Remo user who only needs
+AWS Secrets Manager + age-encrypted local secrets + the plain
+provider for dev. Everything else is feature-gated off.
+
+Crates removable under this scenario (each verified via
+`cargo tree -i <crate>` to be reachable only through dropped
+providers):
+
+| Category | Crates | Cumulative `.text` |
+|---|---|---:|
+| Google Cloud | `openssl_sys` (2.0 MiB; pulled by `reqwest@0.12` → `google-cloud-auth` and `typespec_client_core` → `azure_core`), `google_cloud_secretmanager_v1` (610 KiB), `google_cloud_auth` (396 KiB), `google_cloud_gax_internal` (103 KiB), `google_cloud_gax` (100 KiB), `google_cloud_iam_v1` (31 KiB), `tonic` (132 KiB) | **3.4 MiB** |
+| Azure | `azure_core` (33 KiB), `azure_identity` (27 KiB), `typespec_client_core` (71 KiB), `quick_xml` (104 KiB; mostly Azure) | **235 KiB** |
+| KeePass | `keepass` (235 KiB), `blake2b_simd` (22 KiB) | **257 KiB** |
+| YubiKey / CTAP | `ctap_hid_fido2` (62 KiB), `hidapi` (in long tail; freed only on non-musl builds) | **~62 KiB** |
+| D-Bus / Linux keyring | `dbus` (166 KiB), `libdbus_sys` (96 KiB), `dbus_secret_service` (54 KiB), `dbus_secret_service_keyring_store` (22 KiB) | **338 KiB** |
+| JWT / RSA (used only by JWT-auth providers like GCP) | `jsonwebtoken` (57 KiB), `rsa` (35 KiB), `num_bigint_dig` (63 KiB), `num_bigint` (27 KiB) | **182 KiB** |
+| `reqwest@0.12` (only Google + Azure use it; fnox-core itself uses `reqwest@0.13`) | half of the 241 KiB attributed to reqwest in the bloat snapshot, conservatively | **~120 KiB** |
+| Other transitives reachable only via the dropped chain (long tail) | est. 30–50% of the 621 KiB "152 more crates" tail | **~250 KiB** |
+| **Conservative direct + transitive total** | | **≈ 4.8 MiB of `.text`** |
+| Generic monomorphizations no longer reached (fraction of `[Unknown]` 1.8 MiB) | est. 30% | **+ 540 KiB** |
+| **Final conservative estimate** | | **≈ 5.4 MiB of `.text`** |
+
+`.text` is currently 22.9 MiB; the stripped release binary is 32 MiB
+(31.6 MiB measured via `stat`). Mapping back:
+
+| | Before | After (minimal scenario) | Δ |
+|---|---:|---:|---:|
+| `.text` section | 22.9 MiB | ~17.5 MiB | **-5.4 MiB / -24%** |
+| Stripped binary | 32 MiB | **~25–26 MiB** | **-6–7 MiB / -19–22%** |
+
+So the upstream PR is worth, **conservatively, a 19–22% binary-size
+reduction** for the minimal Remo profile. Users who keep one or two
+additional providers (Vault, 1Password, etc.) save proportionally
+less but still a meaningful chunk.
+
+### PR feasibility
+
+fnox-core's structure is well-suited to a feature-flag PR:
+
+- Each provider is a self-contained file in
+  `crates/fnox-core/src/providers/<name>.rs`.
+- Each has a descriptor TOML in `crates/fnox-core/providers/*.toml`.
+- A build script (`build/generate_providers.rs`) reads the
+  descriptors and emits registration code into `providers/generated/`.
+
+A clean PR would:
+
+1. Add an `optional = true` flag (and group features) for each
+   provider's deps in `Cargo.toml`.
+2. Add a `[features]` block with one feature per provider; `default`
+   includes everything (so existing users see no change).
+3. Wrap each `pub mod foo;` declaration in `providers/mod.rs` with
+   `#[cfg(feature = "foo")]`.
+4. Teach `build/generate_providers.rs` to emit `#[cfg(feature = ...)]`
+   guards around each generated provider entry.
+5. Documentation + a `[features]` reference in the README.
+
+Estimated effort: **6–8 hours** of focused work, plus review
+iteration with the upstream maintainer. The change is mostly
+additive and backward-compatible (all features default on), so the
+review risk is low.
