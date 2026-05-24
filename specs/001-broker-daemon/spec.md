@@ -2,8 +2,67 @@
 
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
-**Status**: Draft
+**Status**: In Progress
+**Last Updated**: 2026-05-24 (commit `7f3ae01`)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
+
+## Implementation Status
+
+Snapshot of what's built versus what's still pending, intended as a quick dashboard. The detailed requirements below remain unchanged.
+
+Legend: **Done** — implemented and tested. **Partial** — landed in pieces; remaining work noted. **Pending** — not started. **Deferred** — explicitly postponed for a later milestone. **Unverified** — likely satisfied by the current build but not measured.
+
+### Functional requirements
+
+| ID | Status | Notes |
+|---|---|---|
+| FR-001 | Done | `src/config.rs` parses `/etc/remo-broker/config.toml` strict-mode with CLI-override precedence (CLI > file > default). |
+| FR-002 | Partial | `file` and `env` sources implemented in `src/bootstrap.rs`; `imds` (FR-002b) deferred — currently returns `BootstrapError::ImdsNotImplemented`. |
+| FR-003 | Done | `src/main.rs` prints to stderr and exits non-zero when no bootstrap source yields a usable token. |
+| FR-004 | Pending | `fnox-core` dependency not yet added; broker has no backend retrieval code. |
+| FR-005 | Pending | Depends on FR-004. |
+| FR-006 | Done | `src/server.rs::ensure_socket_dir` + `bind_admin_socket` create `socket_dir` (0755) and `admin.sock` (0600). |
+| FR-007 | Pending | Per-project socket creation lives in the admin `register` handler, which is currently a stub. |
+| FR-008 | Partial | Admin socket removed on shutdown in `Server::run`; project sockets not yet created so nothing to clean up there. |
+| FR-009 | Done | `bind_admin_socket` removes a stale `admin.sock` before binding; `stale_admin_socket_is_replaced_on_bind` test covers this. |
+| FR-010 | Done | `src/manifest.rs` parses + validates per `docs/manifest-schema.md`; 21 unit tests for the validation rules. |
+| FR-011 | Pending | Needs the project registry. |
+| FR-012 | Pending | No fetch path yet. |
+| FR-013 | Pending | Audit writer ready in `src/audit.rs`; emission on each fetch attempt lands with the fetch path. |
+| FR-014 | Pending | No cache implementation yet. |
+| FR-015 | Pending | Will be covered by the absence of disk persistence in the cache implementation. |
+| FR-016 | Pending | `secrecy::SecretString` is the placeholder; swap to fnox-core's `SecretBox` when FR-004 lands. |
+| FR-017 | Partial | Event types + async writer + degraded-mode buffer done in `src/audit.rs`; per-fetch emission pending FR-013. |
+| FR-018 | Done | Bounded channel + in-memory degraded buffer; tests confirm a wedged file write does not block producers. |
+| FR-019 | Partial | All wire types complete in `src/proto/`; admin `status` handles end-to-end; project socket and remaining admin ops still pending. |
+| FR-020 | Partial | Admin `status` advertises both versions; project-socket `ping` not yet implemented. |
+| FR-021 | Done | `sd_notify_ready()` is called after the admin socket binds; no-op outside systemd. |
+| FR-022 | Done | `install_sigterm` (SIGTERM + SIGINT) + `SHUTDOWN_DRAIN = 5s` + `drain_join_set`. |
+| FR-023 | Pending | No systemd unit file shipped yet. |
+| FR-024 | Done | `JoinSet` spawns one task per admin connection — no global lock. Same pattern will extend to project sockets. |
+
+### Non-functional requirements
+
+| ID | Status | Notes |
+|---|---|---|
+| NFR-001 | Pending | No cache yet to measure. |
+| NFR-002 | Pending | No backend round-trip path yet. |
+| NFR-003 | Unverified | No startup-time benchmark; daemon currently starts in well under 500 ms on a dev box but unmeasured. |
+| NFR-004 | Unverified | No idle-RSS measurement; release-build footprint unmeasured. |
+| NFR-005 | Unverified | No musl/release-build size check yet. |
+| NFR-006 | Done | `rust-toolchain.toml` pins stable; `Cargo.toml` `rust-version = "1.95"`. |
+| NFR-007 | Done | `.github/workflows/ci.yml` runs fmt + `clippy --all-targets -- -D warnings` + test + `cargo audit` + `cargo deny`. |
+
+### Success criteria
+
+| ID | Status | Notes |
+|---|---|---|
+| SC-001 | Pending | No fuzz harness against the NDJSON parser yet. |
+| SC-002 | Pending | No soak harness yet. |
+| SC-003 | Pending | No killtest harness yet. |
+| SC-004 | Partial | Structural guarantee in `src/audit.rs` (event types cannot carry values; `fetch_event_does_not_serialize_a_value_field` test pins it). Full integration grep pending the end-to-end harness. |
+| SC-005 | Pending | No red-team harness; depends on FR-007/012. |
+| SC-006 | Pending | Cross-repo CI depends on the Remo Python codebase and fnox-core landing. |
 
 ## Background and Motivation
 
