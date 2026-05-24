@@ -1586,4 +1586,91 @@ mod tests {
         }
         panic!("admin socket never became connectable after stale-file cleanup");
     }
+
+    /// End-to-end fnox-core integration test. Mirrors the
+    /// `Quick start` / scenarios 0-6 of the CONTRIBUTING playbook
+    /// in-process: writes a hermetic fnox.toml using fnox's `plain`
+    /// provider, constructs a real `BackendSession`, registers a
+    /// project, and proves `get` returns the actual secret value
+    /// from fnox-core (not the degraded-mode stub).
+    ///
+    /// This is the "code-complete, now also CI-proven" check for
+    /// FR-004/FR-005/FR-014/FR-017 end-to-end. Until this test
+    /// landed, the cache-miss → backend → real value path had only
+    /// been verified by hand via the playbook.
+    #[tokio::test]
+    async fn end_to_end_fnox_backend_resolves_a_secret() {
+        use crate::backend::BackendSession;
+
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let fnox_config = dir.path().join("fnox.toml");
+
+        // fnox's `plain` provider is the only one hermetic enough
+        // for CI: no network, no keychain, no external state.
+        std::fs::write(
+            &fnox_config,
+            r#"[providers]
+plain = { type = "plain" }
+
+[secrets]
+HELLO = { provider = "plain", value = "world" }
+"#,
+        )
+        .unwrap();
+
+        let backend =
+            BackendSession::open(&fnox_config).expect("fnox-core opens the hermetic config");
+
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit, Some(backend));
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+
+        let project_dir = write_project(dir.path(), "hello", &["HELLO"]);
+        let register_req = format!(
+            r#"{{"op":"register","name":"hello","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let resp = send_admin(&admin_socket, &register_req).await;
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], true, "register failed: {resp}");
+
+        // First get → cache miss → backend (fnox plain provider).
+        let project_socket = socket_dir.join("hello.sock");
+        let resp = send_project(&project_socket, r#"{"op":"get","name":"HELLO"}"#).await;
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], true, "cold get failed: {resp}");
+        assert_eq!(v["value"], "world", "wrong value: {resp}");
+
+        // Second get → cache hit. Value identical; TTL non-increasing.
+        let resp2 = send_project(&project_socket, r#"{"op":"get","name":"HELLO"}"#).await;
+        let v2: Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["ok"], true);
+        assert_eq!(v2["value"], "world");
+        assert!(
+            v2["ttl_seconds"].as_u64().unwrap() <= v["ttl_seconds"].as_u64().unwrap(),
+            "ttl should be non-increasing across a cache hit",
+        );
+
+        // Audit captured both: one backend=fnox + one backend=cache.
+        let events = wait_for_audit_events(&audit_log, 2).await;
+        assert_eq!(events.len(), 2, "expected 2 fetch events: {events:#?}");
+        assert_eq!(events[0]["backend"], "fnox");
+        assert_eq!(events[1]["backend"], "cache");
+        for e in &events {
+            assert_eq!(e["outcome"], "ok");
+            assert_eq!(e["decision"], "allow");
+            assert!(e.get("value").is_none(), "audit leaked value: {e}");
+        }
+        // The plaintext never reaches the audit log.
+        let log = std::fs::read_to_string(&audit_log).unwrap();
+        assert!(!log.contains("world"), "audit log leaked the value");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
 }
