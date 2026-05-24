@@ -3,7 +3,7 @@
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
 **Status**: In Progress
-**Last Updated**: 2026-05-24 (commit `469e551`)
+**Last Updated**: 2026-05-24 (commit `c3f27fb`)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
 
 ## Implementation Status
@@ -17,7 +17,7 @@ Legend: **Done** — implemented and tested. **Partial** — landed in pieces; r
 | ID | Status | Notes |
 |---|---|---|
 | FR-001 | Done | `src/config.rs` parses `/etc/remo-broker/config.toml` strict-mode with CLI-override precedence (CLI > file > default). |
-| FR-002 | Partial | `file` and `env` sources implemented in `src/bootstrap.rs`; `imds` (FR-002b) deferred — currently returns `BootstrapError::ImdsNotImplemented`. |
+| FR-002 | Done | `file`, `env`, and `imds` sources all implemented in `src/bootstrap.rs`. IMDS does PUT-token → GET-role → GET-credentials over a hand-rolled HTTP/1.1 client on `tokio::net::TcpStream`; structured error variants for the various failure modes. Exercised by an in-process `MockImds` (happy path + 500 + empty role list + empty token body + connection refused). |
 | FR-003 | Done | `src/main.rs` prints to stderr and exits non-zero when no bootstrap source yields a usable token. |
 | FR-004 | Pending | `fnox-core` dependency not yet added; broker has no backend retrieval code. |
 | FR-005 | Pending | Depends on FR-004. |
@@ -71,8 +71,8 @@ Open external decisions that gate forward progress.
 | Dependency | State | Blocks |
 |---|---|---|
 | `fnox-core` source/version | Not chosen. Options: crates.io vs git vs local path. | FR-004, FR-005, the real form of FR-016 (currently `secrecy::SecretString` placeholder), the cache implementation, the fetch path, the `rotate-bootstrap` admin op, User Story 6 (multi-backend). |
-| IMDSv2 HTTP client | Not chosen. Probably a lightweight client (`hyper` or `ureq`) hitting `169.254.169.254` for PUT-token-then-GET-credentials. | FR-002b (`bootstrap_source = "imds"` currently returns `BootstrapError::ImdsNotImplemented`). |
-| Mocked metadata endpoint for IMDS tests | Not designed. | IMDSv2 happy-path tests. |
+| ~~IMDSv2 HTTP client~~ | **Decided**: hand-rolled HTTP/1.1 over `tokio::net::TcpStream`. Three requests against plain-HTTP `169.254.169.254`; pulling in a 500 KB+ HTTP client crate would be disproportionate. ~50 LoC of parse logic, fully unit-tested. | — |
+| ~~Mocked metadata endpoint for IMDS tests~~ | **Decided**: in-process `MockImds` test helper in `src/bootstrap.rs::tests` binds `127.0.0.1:0`, accepts N connections, dispatches on path. No external test fixture needed. | — |
 
 ### Key Implementation Decisions
 
@@ -103,6 +103,9 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 | Audit `latency_ms` measures broker-internal handling time (request bytes received → response bytes about to be written), not end-to-end including socket flush. | The broker's own latency is what's useful for operations; socket flush is dominated by the kernel and the peer, neither of which the broker controls. | `src/server.rs::handle_project_connection` |
 | `emit_fetch` is called **before** the response is serialized, so a slow / wedged socket write doesn't lose the audit record. | The audit record is the security artifact; the response is the user-facing artifact. If we have to choose between losing one, lose the response. (In practice `AuditWriter::record` is a `try_send` returning in microseconds, so the choice is mostly theoretical.) | `src/server.rs::dispatch_project` |
 | `ping` / `info` / protocol errors do not emit audit events. | FR-013 says "every fetch attempt"; non-fetch ops and unparseable requests aren't fetches. A protocol error has no secret name to record. Auditing ping/info would just add noise an operator has to filter through. | `src/server.rs::dispatch_project` |
+| Hand-rolled HTTP/1.1 client for IMDSv2 instead of an HTTP-client crate. | Three requests against a plain-HTTP link-local endpoint don't justify a 500 KB+ dependency. Hand-rolled is ~50 LoC of parse logic and avoids transitive license / audit-surface concerns. If we ever need TLS or HTTP/2 we'll reach for `hyper`. | `src/bootstrap.rs` |
+| IMDS credentials JSON is wrapped *verbatim* in `BootstrapToken` (a `SecretString`) rather than parsed into typed fields. | The broker doesn't itself use the AWS credentials — fnox-core does. Keeping the blob opaque means we don't have to track AWS-credential schema drift, and the eventual swap to `fnox_core::SecretBox` is a one-line change. | `src/bootstrap.rs::fetch_imds_at` |
+| Per-call IMDS timeout is 2 s. | The metadata service is link-local and usually answers in milliseconds; longer means we're not actually on EC2 and should fail fast rather than wedge `READY=1`. | `src/bootstrap.rs::IMDS_TIMEOUT` |
 | Drain on SIGTERM **and** SIGINT. | Ctrl-C during dev produces the same clean shutdown systemd would. | `src/server.rs::install_sigterm` |
 | Tests use hand-rolled RAII tempdir helpers; no `tempfile` crate dependency. | Helpers are ~15 LoC per module; avoids pulling in a transitive dep just for tests. | every `mod tests` |
 | Tests that mutate env use unique per-test variable names. | `std::env::set_var` is `unsafe` in edition 2024; unique names avoid cross-test races without serializing. | `src/bootstrap.rs::tests` |
@@ -112,21 +115,21 @@ Non-obvious calls made during implementation, with rationale. These are the kind
 
 Items the spec calls for that we've consciously postponed, in roughly the order we plan to tackle them. This list is exhaustive against the requirements above — anything not yet "Done" appears here.
 
-1. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox` in `BootstrapToken` and `BoundedCache`; wire up the actual backend fetch in `dispatch_project::Get` where `backend_error` is currently stubbed. The cache + audit emission machinery is already in place and will start carrying real values + `Outcome::Ok` audit records the moment a fetch returns a value.
-2. **IMDSv2 bootstrap source** (FR-002b). Small HTTP client against `169.254.169.254`; mocked metadata endpoint in tests.
-3. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core. Currently the only admin op still stubbing `internal_error`.
-4. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
-5. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
-6. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
-7. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
-8. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted. Note that peer_pid/peer_uid are *recorded* in audit events as of `469e551` — the open question is what to *enforce*.
-9. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
+1. **fnox-core integration** (FR-004, FR-005, real FR-016 via `SecretBox`, User Story 6 multi-backend, parts of `rotate-bootstrap`). Replace `secrecy::SecretString` with `fnox_core::SecretBox` in `BootstrapToken` and `BoundedCache`; wire up the actual backend fetch in `dispatch_project::Get` where `backend_error` is currently stubbed. The bootstrap-token resolver (file/env/imds), cache, and audit emission machinery are all in place and will start carrying real values + `Outcome::Ok` audit records the moment a fetch returns a value.
+2. **`rotate-bootstrap` admin op** (User Story 5). Depends on fnox-core. Currently the only admin op still stubbing `internal_error`.
+3. **systemd unit + hardening** (FR-023). `remo-broker.service` with `LimitCORE=0`, `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes`, `RestrictSUIDSGID=yes`, `User=remo-broker`, `Group=remo-broker`, `ReadWritePaths=/run/remo-broker /var/log/remo-broker`, `LoadCredentialEncrypted=bootstrap-token:/etc/remo-broker/bootstrap-token`. The unit also fixes the project-socket group-ownership half of FR-007.
+4. **JSON Schema artifact generation** (manifest-schema.md §Compatibility commitments). Emit `schema/remo-broker.v1.json` from `src/manifest.rs` types and publish per release; Remo (Python) pins to this artifact.
+5. **Test harnesses** (SC-001 NDJSON-parser fuzz, SC-002 1-hour 50×10 Hz soak, SC-003 killtest, SC-005 red-team, SC-006 cross-repo CI against Remo Python).
+6. **NFR verification** (NFR-001 warm cache p99 ≤ 5 ms, NFR-002 cold latency, NFR-003 startup ≤ 500 ms, NFR-004 idle RSS ≤ 30 MB, NFR-005 static binary ≤ 15 MB / musl target).
+7. **`peer_unexpected` enforcement on the project socket** (OQ-6). Spec leaves the exact policy open; needs a decision before project-socket peer-credential checks can land in their final form. Currently the `ProjectErrorCode::PeerUnexpected` variant exists in the wire types but is never emitted. Note that peer_pid/peer_uid are *recorded* in audit events as of `469e551` — the open question is what to *enforce*.
+8. **Push to `origin/main` requires `gh auth login`** in this devcontainer — currently the operator handles pushes manually after I make commits. Not a deferral of feature work, but worth recording so the next session doesn't rediscover it.
 
 **Resolved open questions**:
 
+- **OQ-2** (IMDS refresh): Resolved as **no auto-refresh in the broker**. fnox-core will handle AWS credential rotation internally. Confirmed by the IMDS implementation in commit `c3f27fb`: `fetch_imds_at` is called once at startup and once on `rotate-bootstrap`; the daemon never schedules its own refresh.
 - **OQ-3** (LRU vs bounded cache): Resolved as **bounded with FIFO-by-write eviction** (drop oldest by `fetched_at`). Strict LRU would require write-locking on every read to update access time; we keep reads lock-light. See `src/cache.rs` module docs.
 
-**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020) — commit `7ef64d9`. Per-project bounded cache with zeroize-on-drop wired into the `get` path (FR-014/015 + most of FR-016) — commit `67ed104`. Per-fetch audit emission with `SO_PEERCRED` (FR-013, FR-017, and the audit-log half of SC-004) — commit `469e551`.
+**Recently completed** (no longer in the roadmap): project registry + admin op handlers (FR-007/008/010/011/019 admin plane); project socket binding + connection loop + `ping`/`info`/`get` with allowlist enforcement (FR-007/008/012/019 project plane/020) — commit `7ef64d9`. Per-project bounded cache with zeroize-on-drop wired into the `get` path (FR-014/015 + most of FR-016) — commit `67ed104`. Per-fetch audit emission with `SO_PEERCRED` (FR-013, FR-017, and the audit-log half of SC-004) — commit `469e551`. IMDSv2 bootstrap source with structured errors + in-process mock metadata endpoint (FR-002b, the rest of FR-002) — commit `c3f27fb`.
 
 ## Background and Motivation
 
