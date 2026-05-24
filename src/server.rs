@@ -1,18 +1,23 @@
-//! Daemon harness and admin socket loop.
+//! Daemon harness, admin socket loop, and per-project socket loops.
 //!
 //! Implements:
 //! - FR-006: create socket_dir + admin socket at startup (mode 0600).
-//! - FR-008/FR-009: remove sockets on shutdown; tolerate stale socket files.
-//! - FR-019/FR-020: speak the admin wire protocol; advertise broker_version
-//!   and protocol_version in status.
-//! - FR-021: send READY=1 via sd_notify after sockets are bound.
+//! - FR-007: bind per-project sockets on `register` (mode 0660).
+//! - FR-008/FR-009: remove sockets on `unregister` / shutdown; tolerate stale
+//!   socket files.
+//! - FR-012: allowlist check happens before any backend round-trip.
+//! - FR-019/FR-020: speak the admin and project wire protocols; advertise
+//!   `broker_version` + `protocol_version` in `status` and `ping`.
+//! - FR-021: send `READY=1` via `sd_notify` after sockets are bound.
 //! - FR-022: handle SIGTERM by stopping accept, draining in-flight up to 5s,
 //!   then exiting cleanly.
+//! - FR-024: per-connection spawn — no global serialization across projects.
 //!
-//! Per-project sockets, register/unregister/reload, and rotate-bootstrap are
-//! intentionally stubbed (returning `internal_error`) until the project
-//! registry and fnox-core integration land.
+//! `rotate-bootstrap` and the actual backend fetch in `get` remain stubbed
+//! (returning `internal_error` / `backend_error`) until fnox-core integration
+//! lands. Allowlist denial in `get` is fully wired (FR-012).
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,16 +26,20 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::audit::{AuditEvent, AuditWriter, ShutdownEvent, WriterShutdown};
 use crate::config::{BootstrapSource, Config};
 use crate::proto::MAX_MESSAGE_BYTES;
 use crate::proto::admin::{
-    AdminError, AdminErrorCode, AdminRequest, BootstrapMode, OkResponse, RegisterResponse,
-    ReloadResponse, RotateBootstrapResponse, StatusResponse,
+    AdminError, AdminErrorCode, AdminRequest, BootstrapMode, OkResponse, ProjectStatus,
+    RegisterResponse, ReloadResponse, StatusResponse,
 };
+use crate::proto::project::{
+    GetResponse, InfoResponse, PingResponse, ProjectError, ProjectErrorCode, ProjectRequest,
+};
+use crate::registry::{Project, ProjectRegistry, RegistryError};
 
 /// Max time the daemon waits for in-flight admin connections to finish
 /// after SIGTERM. Beyond this we abort the JoinSet and exit (FR-022).
@@ -74,14 +83,23 @@ pub struct Server {
     config: Config,
     audit: AuditWriter,
     started_at: Instant,
+    registry: Arc<ProjectRegistry>,
+    /// Accept-loop `JoinHandle`s for currently-registered projects, keyed by
+    /// project name. Populated on `register`, drained on `unregister` /
+    /// shutdown. Held inside a `Mutex` (not `RwLock`) because the only
+    /// readers also mutate.
+    project_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl Server {
     pub fn new(config: Config, audit: AuditWriter) -> Self {
+        let registry = Arc::new(ProjectRegistry::new(config.socket_dir.clone()));
         Self {
             config,
             audit,
             started_at: Instant::now(),
+            registry,
+            project_tasks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,9 +147,33 @@ impl Server {
             }
         }
 
-        // FR-022: drain in-flight up to 5s, then bail.
+        // FR-022: drain in-flight up to 5s, then bail. The 5s budget is
+        // shared across all project loops and the admin loop so total
+        // shutdown stays bounded regardless of how many projects are
+        // registered.
         sd_notify_stopping();
-        drain_join_set(&mut connections, SHUTDOWN_DRAIN).await;
+        let shutdown_deadline = Instant::now() + SHUTDOWN_DRAIN;
+
+        // Drain project accept loops first: signal each project's `stop`,
+        // then await its accept-loop task (with abort on deadline so
+        // hung connections don't leak `Arc<Server>` and stall audit drain).
+        drain_project_loops(&shared, shutdown_deadline).await;
+
+        // Remove project sockets after their loops have exited (FR-008).
+        for project in shared.registry.snapshot().await {
+            if let Err(e) = std::fs::remove_file(&project.socket_path) {
+                tracing::warn!(
+                    error = %e,
+                    path = %project.socket_path.display(),
+                    project = %project.name,
+                    "failed to remove project socket on shutdown"
+                );
+            }
+        }
+
+        // Remaining drain budget for admin connections (FR-022).
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        drain_join_set(&mut connections, remaining).await;
 
         // Remove the admin socket so the next daemon start binds cleanly
         // (FR-008). Don't fail shutdown on cleanup error — log and move on.
@@ -150,6 +192,8 @@ impl Server {
                 config: arc.config.clone(),
                 audit: arc.audit.clone(),
                 started_at: arc.started_at,
+                registry: arc.registry.clone(),
+                project_tasks: Mutex::new(HashMap::new()),
             }
         });
         let WriterShutdown {
@@ -279,7 +323,7 @@ async fn handle_admin_connection(server: Arc<Server>, stream: UnixStream) -> std
             return Ok(()); // EOF
         }
         let response_json = match serde_json::from_slice::<AdminRequest>(&line) {
-            Ok(req) => dispatch_admin(&server, req),
+            Ok(req) => dispatch_admin(&server, req).await,
             Err(e) => serde_json::to_string(&AdminError::new(
                 AdminErrorCode::ProtocolError,
                 format!("malformed request: {e}"),
@@ -313,35 +357,123 @@ where
     Ok(n)
 }
 
-fn dispatch_admin(server: &Server, req: AdminRequest) -> String {
+async fn dispatch_admin(server: &Arc<Server>, req: AdminRequest) -> String {
     match req {
-        AdminRequest::Status => {
-            let resp = StatusResponse::new(
-                env!("CARGO_PKG_VERSION"),
-                server.started_at.elapsed().as_secs(),
-                bootstrap_mode(&server.config.bootstrap),
-                Vec::new(),
-            );
-            serde_json::to_string(&resp).expect("StatusResponse always serializes")
+        AdminRequest::Status => dispatch_status(server).await,
+        AdminRequest::Register { name, project_path } => {
+            dispatch_register(server, &name, &project_path).await
         }
-        AdminRequest::Register { .. }
-        | AdminRequest::Unregister { .. }
-        | AdminRequest::Reload { .. }
-        | AdminRequest::RotateBootstrap => {
-            // Stubs: real implementations land with the project registry +
-            // fnox-core integration. Returned shape exists so clients can
-            // depend on the call-and-response contract today.
-            let _ = std::any::type_name_of_val(&RegisterResponse::new("/"));
-            let _ = OkResponse::new();
-            let _ = ReloadResponse::new(Vec::<String>::new());
-            let _ = RotateBootstrapResponse::ok();
-            serde_json::to_string(&AdminError::new(
-                AdminErrorCode::InternalError,
-                "operation not yet implemented in this build",
-            ))
-            .expect("AdminError always serializes")
-        }
+        AdminRequest::Unregister { name } => dispatch_unregister(server, &name).await,
+        AdminRequest::Reload { name } => dispatch_reload(server, &name).await,
+        AdminRequest::RotateBootstrap => serde_json::to_string(&AdminError::new(
+            AdminErrorCode::InternalError,
+            "rotate-bootstrap not yet implemented in this build",
+        ))
+        .expect("AdminError always serializes"),
     }
+}
+
+async fn dispatch_status(server: &Arc<Server>) -> String {
+    let projects = server.registry.snapshot().await;
+    let project_statuses: Vec<ProjectStatus> = projects
+        .iter()
+        .map(|p| {
+            let m = p.manifest();
+            ProjectStatus {
+                name: p.name.clone(),
+                socket_path: p.socket_path.clone(),
+                allowlist_size: m.allowlist.secrets.len() as u32,
+                // Cache not yet implemented; will be wired with FR-014.
+                cache_entries: 0,
+            }
+        })
+        .collect();
+    let resp = StatusResponse::new(
+        env!("CARGO_PKG_VERSION"),
+        server.started_at.elapsed().as_secs(),
+        bootstrap_mode(&server.config.bootstrap),
+        project_statuses,
+    );
+    serde_json::to_string(&resp).expect("StatusResponse always serializes")
+}
+
+async fn dispatch_register(server: &Arc<Server>, name: &str, project_path: &Path) -> String {
+    match server.registry.register(name, project_path).await {
+        Ok((project, listener)) => {
+            let socket_path = project.socket_path.clone();
+            let server_for_task = Arc::clone(server);
+            let project_for_task = Arc::clone(&project);
+            let handle = tokio::spawn(async move {
+                run_project_socket(server_for_task, project_for_task, listener).await;
+            });
+            server
+                .project_tasks
+                .lock()
+                .await
+                .insert(name.to_string(), handle);
+            tracing::info!(project = %name, socket = %socket_path.display(), "project registered");
+            let resp = RegisterResponse::new(socket_path);
+            serde_json::to_string(&resp).expect("RegisterResponse always serializes")
+        }
+        Err(e) => admin_error_for(&e),
+    }
+}
+
+async fn dispatch_unregister(server: &Arc<Server>, name: &str) -> String {
+    match server.registry.unregister(name).await {
+        Ok(project) => {
+            project.stop.notify_waiters();
+            let handle = server.project_tasks.lock().await.remove(name);
+            if let Some(mut h) = handle {
+                // Cap per-project unregister at SHUTDOWN_DRAIN so a wedged
+                // connection on one project doesn't pin the admin loop.
+                match tokio::time::timeout(SHUTDOWN_DRAIN, &mut h).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(project = %name, "unregister drain timeout; aborting");
+                        h.abort();
+                        let _ = h.await;
+                    }
+                }
+            }
+            if let Err(e) = std::fs::remove_file(&project.socket_path) {
+                tracing::warn!(
+                    error = %e,
+                    project = %name,
+                    path = %project.socket_path.display(),
+                    "failed to remove project socket on unregister"
+                );
+            }
+            tracing::info!(project = %name, "project unregistered");
+            serde_json::to_string(&OkResponse::new()).expect("OkResponse always serializes")
+        }
+        Err(e) => admin_error_for(&e),
+    }
+}
+
+async fn dispatch_reload(server: &Arc<Server>, name: &str) -> String {
+    match server.registry.reload(name).await {
+        Ok(manifest) => {
+            tracing::info!(project = %name, "manifest reloaded");
+            let resp = ReloadResponse::new(manifest.allowlist.secrets.clone());
+            serde_json::to_string(&resp).expect("ReloadResponse always serializes")
+        }
+        Err(e) => admin_error_for(&e),
+    }
+}
+
+fn admin_error_for(e: &RegistryError) -> String {
+    let code = match e {
+        RegistryError::ProjectExists(_) => AdminErrorCode::ProjectExists,
+        RegistryError::ProjectUnknown(_) => AdminErrorCode::ProjectUnknown,
+        RegistryError::ManifestNotFound(_) => AdminErrorCode::ManifestNotFound,
+        RegistryError::ManifestInvalid(_) => AdminErrorCode::ManifestInvalid,
+        RegistryError::BindSocket { .. } | RegistryError::SocketPerms { .. } => {
+            AdminErrorCode::InternalError
+        }
+    };
+    serde_json::to_string(&AdminError::new(code, e.to_string()))
+        .expect("AdminError always serializes")
 }
 
 fn bootstrap_mode(source: &BootstrapSource) -> BootstrapMode {
@@ -349,6 +481,135 @@ fn bootstrap_mode(source: &BootstrapSource) -> BootstrapMode {
         BootstrapSource::File { .. } => BootstrapMode::File,
         BootstrapSource::Imds => BootstrapMode::Imds,
         BootstrapSource::Env => BootstrapMode::Env,
+    }
+}
+
+// ---- project socket loop ------------------------------------------------
+
+/// Per-project accept loop. Lives in a tokio task spawned by `dispatch_register`.
+/// Exits when `project.stop` is notified (unregister or daemon shutdown).
+async fn run_project_socket(server: Arc<Server>, project: Arc<Project>, listener: UnixListener) {
+    let mut connections = JoinSet::new();
+    loop {
+        // Pin a fresh `notified()` future per iteration and `enable()` it
+        // synchronously so a `notify_waiters()` racing with the start of
+        // the iteration is captured rather than lost.
+        let stop = project.stop.notified();
+        tokio::pin!(stop);
+        stop.as_mut().enable();
+
+        tokio::select! {
+            biased;
+            () = stop => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let server = Arc::clone(&server);
+                        let project = Arc::clone(&project);
+                        connections.spawn(async move {
+                            if let Err(e) = handle_project_connection(server, project, stream).await {
+                                tracing::warn!(error = %e, "project connection error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, project = %project.name, "project accept failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+    }
+    drain_join_set(&mut connections, SHUTDOWN_DRAIN).await;
+}
+
+async fn handle_project_connection(
+    server: Arc<Server>,
+    project: Arc<Project>,
+    stream: UnixStream,
+) -> std::io::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = Vec::with_capacity(256);
+
+    loop {
+        line.clear();
+        let n = read_line_capped(&mut reader, &mut line, MAX_MESSAGE_BYTES).await?;
+        if n == 0 {
+            return Ok(()); // EOF
+        }
+        let response_json = match serde_json::from_slice::<ProjectRequest>(&line) {
+            Ok(req) => dispatch_project(&server, &project, req),
+            Err(e) => serde_json::to_string(&ProjectError::new(
+                ProjectErrorCode::ProtocolError,
+                format!("malformed request: {e}"),
+            ))
+            .expect("ProjectError always serializes"),
+        };
+        write_half.write_all(response_json.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?;
+    }
+}
+
+fn dispatch_project(_server: &Server, project: &Project, req: ProjectRequest) -> String {
+    match req {
+        ProjectRequest::Ping => {
+            let resp = PingResponse::new(env!("CARGO_PKG_VERSION"), project.name.clone());
+            serde_json::to_string(&resp).expect("PingResponse always serializes")
+        }
+        ProjectRequest::Info => {
+            let manifest = project.manifest();
+            let resp = InfoResponse::new(
+                project.name.clone(),
+                manifest.allowlist.secrets.clone(),
+                manifest.schema_version,
+            );
+            serde_json::to_string(&resp).expect("InfoResponse always serializes")
+        }
+        ProjectRequest::Get { name } => {
+            let manifest = project.manifest();
+            // FR-012: allowlist denial does not incur a backend round-trip.
+            if !manifest.allowlist.secrets.iter().any(|n| n == &name) {
+                return serde_json::to_string(&ProjectError::new(
+                    ProjectErrorCode::Denied,
+                    format!("Secret {name:?} is not in this project's allowlist."),
+                ))
+                .expect("ProjectError always serializes");
+            }
+            // Allowlist passed; backend fetch path (FR-004/FR-005) is not
+            // yet wired. Stub with `backend_error` until fnox-core lands —
+            // exposed shape would be `GetResponse::utf8(value, ttl)`.
+            let _ = GetResponse::utf8("placeholder", 0);
+            serde_json::to_string(&ProjectError::new(
+                ProjectErrorCode::BackendError,
+                "backend fetch not yet implemented in this build",
+            ))
+            .expect("ProjectError always serializes")
+        }
+    }
+}
+
+/// Stop and drain every running project accept loop under a single deadline.
+/// On per-task timeout we abort the task so it releases its `Arc<Server>`
+/// clone — otherwise the audit writer in main would never observe the last
+/// sender drop and would hang the daemon on shutdown.
+async fn drain_project_loops(server: &Arc<Server>, deadline: Instant) {
+    let projects = server.registry.snapshot().await;
+    for project in &projects {
+        project.stop.notify_waiters();
+    }
+    let tasks: HashMap<String, JoinHandle<()>> =
+        std::mem::take(&mut *server.project_tasks.lock().await);
+    for (name, mut handle) in tasks {
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(project = %name, "project drain timeout; aborting");
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
     }
 }
 
@@ -481,35 +742,247 @@ mod tests {
         let _ = server_handle.await;
     }
 
-    #[tokio::test]
-    async fn stub_ops_return_internal_error() {
-        let dir = tempdir();
-        let socket_dir = dir.path().join("run");
-        let audit_log = dir.path().join("audit.log");
-        let config = test_config(&socket_dir, &audit_log);
-        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
-        let server = Server::new(config, audit);
-        let server_handle = tokio::spawn(server.run());
+    /// Build `<root>/<name>/.remo/broker.toml` with the given allowlist and
+    /// return the project root path the admin caller would pass.
+    fn write_project(root: &Path, name: &str, allowlist: &[&str]) -> PathBuf {
+        let project_dir = root.join(name);
+        let remo_dir = project_dir.join(".remo");
+        std::fs::create_dir_all(&remo_dir).unwrap();
+        let secrets = allowlist
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest = format!(
+            "schema_version = 1\n\n\
+             [project]\n\
+             name = \"{name}\"\n\n\
+             [allowlist]\n\
+             secrets = [{secrets}]\n"
+        );
+        std::fs::write(remo_dir.join("broker.toml"), manifest).unwrap();
+        project_dir
+    }
 
-        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
-        for _ in 0..50 {
-            if admin_socket.exists() {
-                break;
+    async fn send_project(socket: &Path, request: &str) -> String {
+        let stream = UnixStream::connect(socket).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(request.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        write.shutdown().await.unwrap();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        line
+    }
+
+    async fn wait_for_path(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        panic!("path never appeared: {}", path.display());
+    }
 
-        for op in [
-            r#"{"op":"register","name":"a","project_path":"/p"}"#,
-            r#"{"op":"unregister","name":"a"}"#,
-            r#"{"op":"reload","name":"a"}"#,
-            r#"{"op":"rotate-bootstrap"}"#,
-        ] {
-            let response = send_admin(&admin_socket, op).await;
-            let v: Value = serde_json::from_str(&response).unwrap();
-            assert_eq!(v["ok"], false, "op={op} response={response}");
-            assert_eq!(v["code"], "internal_error", "op={op}");
+    async fn wait_for_path_gone(path: &Path) {
+        for _ in 0..100 {
+            if !path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        panic!("path lingered: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn rotate_bootstrap_returns_internal_error() {
+        // Only remaining stub on the admin plane; fnox-core integration
+        // replaces this with a real backend re-auth.
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+
+        let response = send_admin(&admin_socket, r#"{"op":"rotate-bootstrap"}"#).await;
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "internal_error");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn register_lifecycle_end_to_end() {
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+
+        // register → socket appears
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let response = send_admin(&admin_socket, &req).await;
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], true, "register failed: {response}");
+        let project_socket = socket_dir.join("alpha.sock");
+        assert_eq!(v["socket_path"], project_socket.to_str().unwrap());
+        wait_for_path(&project_socket).await;
+
+        // ping over the project socket works
+        let ping = send_project(&project_socket, r#"{"op":"ping"}"#).await;
+        let v: Value = serde_json::from_str(&ping).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["project"], "alpha");
+        assert_eq!(v["broker_version"], env!("CARGO_PKG_VERSION"));
+
+        // info reports the allowlist atomically loaded
+        let info = send_project(&project_socket, r#"{"op":"info"}"#).await;
+        let v: Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["allowlist"], serde_json::json!(["FOO"]));
+        assert_eq!(v["schema_version"], 1);
+
+        // FR-012: allowlist denial does not invoke the backend
+        let denied = send_project(&project_socket, r#"{"op":"get","name":"BAR"}"#).await;
+        let v: Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "denied");
+
+        // get for an allowlisted name reaches the (stubbed) backend path
+        let allowed = send_project(&project_socket, r#"{"op":"get","name":"FOO"}"#).await;
+        let v: Value = serde_json::from_str(&allowed).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "backend_error");
+
+        // status reflects the registration
+        let status = send_admin(&admin_socket, r#"{"op":"status"}"#).await;
+        let v: Value = serde_json::from_str(&status).unwrap();
+        let projects = v["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], "alpha");
+        assert_eq!(projects[0]["allowlist_size"], 1);
+
+        // unregister tears the socket down
+        let response = send_admin(&admin_socket, r#"{"op":"unregister","name":"alpha"}"#).await;
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], true);
+        wait_for_path_gone(&project_socket).await;
+
+        // status now empty again
+        let status = send_admin(&admin_socket, r#"{"op":"status"}"#).await;
+        let v: Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(v["projects"], serde_json::json!([]));
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_register_returns_project_exists() {
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+        let response = send_admin(&admin_socket, &req).await;
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "project_exists");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn register_with_missing_manifest_returns_manifest_not_found() {
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = dir.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let response = send_admin(&admin_socket, &req).await;
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "manifest_not_found");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn reload_propagates_new_allowlist() {
+        let dir = tempdir();
+        let socket_dir = dir.path().join("run");
+        let audit_log = dir.path().join("audit.log");
+        let (audit, _audit_handle) = AuditWriter::spawn(audit_log.clone());
+        let server = Server::new(test_config(&socket_dir, &audit_log), audit);
+        let server_handle = tokio::spawn(server.run());
+
+        let admin_socket = socket_dir.join(ADMIN_SOCKET_NAME);
+        wait_for_path(&admin_socket).await;
+        let project_dir = write_project(dir.path(), "alpha", &["FOO"]);
+        let req = format!(
+            r#"{{"op":"register","name":"alpha","project_path":"{}"}}"#,
+            project_dir.display()
+        );
+        let _ = send_admin(&admin_socket, &req).await;
+        let project_socket = socket_dir.join("alpha.sock");
+
+        // Rewrite the manifest then reload.
+        let _ = write_project(dir.path(), "alpha", &["FOO", "BAR"]);
+        let response = send_admin(&admin_socket, r#"{"op":"reload","name":"alpha"}"#).await;
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["allowlist"], serde_json::json!(["FOO", "BAR"]));
+
+        // Existing project socket sees the new allowlist (atomic swap, no
+        // socket teardown — FR-011 + User Story 3 scenario 2).
+        let info = send_project(&project_socket, r#"{"op":"info"}"#).await;
+        let v: Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(v["allowlist"], serde_json::json!(["FOO", "BAR"]));
+
+        let denied = send_project(&project_socket, r#"{"op":"get","name":"BAR"}"#).await;
+        let v: Value = serde_json::from_str(&denied).unwrap();
+        // BAR is now in the allowlist post-reload, so we go to the stub
+        // backend path rather than denial.
+        assert_eq!(v["code"], "backend_error");
 
         server_handle.abort();
         let _ = server_handle.await;
