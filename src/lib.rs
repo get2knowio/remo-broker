@@ -5,3 +5,4 @@
 //! binary's CLI surface.
 
 pub mod manifest;
+pub mod proto;
