@@ -275,10 +275,10 @@ echo '{"op":"get","name":"GITHUB_TOKEN"}' | socat - UNIX-CONNECT:/tmp/rb/run/hel
 
 **Proves**: allowlist check happens before backend (FR-012).
 
-### 9. Get an allowed name fnox can't resolve → not_found
+### 9. Reload, then get an allowed name fnox can't resolve
 
-Add an allowlist entry for a name fnox doesn't define, reload, then
-fetch.
+Add an allowlist entry for a name fnox doesn't define, `reload`,
+then fetch.
 
 ```bash
 cat > /tmp/hello/.remo/broker.toml <<'EOF'
@@ -295,15 +295,27 @@ echo '{"op":"reload","name":"hello"}' | socat - UNIX-CONNECT:/tmp/rb/run/admin.s
 # → {"ok":true,"allowlist":["HELLO","NPM_TOKEN","UNDEFINED"]}
 
 echo '{"op":"get","name":"UNDEFINED"}' | socat - UNIX-CONNECT:/tmp/rb/run/hello.sock
-# → {"ok":false,"code":"backend_error",…}   OR   {"ok":false,"code":"not_found",…}
+# → {"ok":false,"code":"backend_error","message":"fnox-core: Secret 'UNDEFINED' not found in profile 'default' …"}
 ```
 
-(Exact code depends on whether fnox-core treats "undeclared key" as
-`Err` or as `Ok(None)`; both are valid surface behaviours from the
-broker.)
+The broker's two surface codes for "couldn't fetch" map to fnox-core's
+return shape:
 
-**Proves**: reload picks up new allowlist atomically (FR-011),
-backend errors / not-found surface cleanly.
+- `backend_error` — fnox-core returned `Err`. **This is what you get
+  for a name that simply isn't declared in `fnox.toml`** — fnox treats
+  an undeclared key as an error, not as a missing value.
+- `not_found` — fnox-core returned `Ok(None)`. Only fires for keys
+  that *are* declared in `fnox.toml` but use `if_missing = "ignore"`
+  or `"warn"` and have no value at resolve time.
+
+So the case in this scenario (an allowlist name with no matching
+`[secrets]` entry) always lands in `backend_error`. To exercise the
+`not_found` path you'd need an `if_missing`-marked secret in
+`fnox.toml`.
+
+**Proves**: reload picks up the new allowlist atomically (FR-011);
+fnox-core errors surface as `backend_error` with the underlying
+message attached for operator triage.
 
 ### 10. Status reflects current state
 
