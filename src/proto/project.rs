@@ -159,8 +159,7 @@ mod tests {
         // Per wire-protocol.md §4, additive changes are allowed within a
         // major protocol version: new optional request fields. A v1 broker
         // must therefore tolerate unknown fields a v1.x client may send.
-        let req: ProjectRequest =
-            serde_json::from_str(r#"{"op":"ping","extra":1}"#).unwrap();
+        let req: ProjectRequest = serde_json::from_str(r#"{"op":"ping","extra":1}"#).unwrap();
         assert_eq!(req, ProjectRequest::Ping);
     }
 
