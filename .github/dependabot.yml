@@ -1,0 +1,58 @@
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Weekly updates for Cargo + GitHub Actions. The Cargo side is the
+# noisier one because of fnox-core's wide transitive dep tree (AWS SDK,
+# rustls, hyper, etc.) — Dependabot only opens PRs for direct deps, so
+# the noise is bounded, but light grouping keeps related crates that
+# release in lockstep (serde, tracing) in a single PR each.
+#
+# When Dependabot bumps a dep that touches advisories or licenses,
+# `cargo deny check` runs in CI and will surface the change. See
+# `deny.toml`'s `[advisories].ignore` list — the documented exceptions
+# may need updating when upstream crates patch their advisories.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    groups:
+      serde:
+        patterns:
+          - "serde"
+          - "serde_*"
+          - "serde-*"
+      tracing:
+        patterns:
+          - "tracing"
+          - "tracing-*"
+      tokio:
+        patterns:
+          - "tokio"
+          - "tokio-*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      # Action updates almost always land as a batch (security or
+      # version-pin bumps); one PR per week beats five.
+      all-actions:
+        patterns:
+          - "*"
