@@ -39,7 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # "Compatibility commitments"). Off by default so the production
 # binary doesn't link schemars; enabled in CI to regenerate +
 # snapshot-test `schema/remo-broker.v1.json`.
-schemars = { version = "0.8", optional = true }
+schemars = { version = "1.2", optional = true }
 
 [dev-dependencies]
 # NFR-001/NFR-002 latency benchmarks. Criterion is the canonical Rust
