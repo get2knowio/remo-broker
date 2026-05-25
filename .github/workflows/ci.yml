@@ -15,7 +15,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -25,7 +25,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -39,7 +39,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
@@ -50,7 +50,7 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -62,7 +62,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: List accepted advisories (visibility)
         # Surfaces deny.toml's [advisories].ignore list in every CI run
         # so the six accepted RUSTSEC entries stay visible. Without this
@@ -86,7 +86,7 @@ jobs:
     name: systemd unit lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # systemd-analyze fails the exec-check unless /usr/bin/remo-broker
       # is present; stub with /bin/true so verify only complains about
       # real unit-syntax issues.
@@ -102,7 +102,7 @@ jobs:
     # under SIGKILL). Full SC-002 (50 sockets × 10 Hz × 1h) lives in
     # the scheduled `.github/workflows/soak.yml` workflow.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
@@ -120,7 +120,7 @@ jobs:
     # still compile and a `--quick` pass returns. Real numbers come
     # from manual `cargo bench` runs by humans.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
@@ -135,7 +135,7 @@ jobs:
     # fnox-core dep chain (AWS SDK + ctap-hid-fido2 + transitives) puts
     # the binary at ~32MiB. Track NFR-005 follow-up in the spec.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev socat
