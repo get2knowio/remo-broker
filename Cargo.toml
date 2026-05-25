@@ -47,7 +47,7 @@ schemars = { version = "0.8", optional = true }
 # in CI, so we turn it off to drop a stack of transitive deps.
 # `async_tokio` enables `b.to_async(&runtime).iter(...)` for benching
 # async functions, which is everything in this crate.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
 
 [[bench]]
 name = "latency"
