@@ -145,11 +145,15 @@ for current FR / NFR / SC status and the
 [roadmap](specs/001-broker-daemon/spec.md#deferred-work-and-roadmap)
 for what's queued next.
 
-The broker daemon itself is feature-complete against the spec's functional
-requirements; remaining work is verification (latency / RSS / binary-size
-measurement, fuzz / soak / killtest / red-team harnesses), some operational
-edges (project-socket group ownership, `peer_unexpected` policy), and shipping
-artifacts (JSON Schema, `.deb`/`.rpm`).
+Every functional requirement is implemented, latency / RSS / startup are
+measured in CI, and a JSON Schema artifact ships per release. The
+remaining gaps the spec calls out are decisions blocked on the consuming
+Remo project (project-socket group-ownership, `peer_unexpected` policy)
+plus longer-running test infrastructure that lives outside the per-PR CI
+(full 24-hour cargo-fuzz, SC-005 red-team). Open binary-size follow-up:
+fnox-core's transitive dep tree pulls every provider unconditionally — a
+[downstream PR](https://github.com/jdx/fnox/pull/502) proposes
+per-provider Cargo features which would unlock a ~20% reduction.
 
 ## Architecture notes
 
@@ -175,24 +179,58 @@ Module map:
 | `src/registry.rs` | `ProjectRegistry` + per-project `Project` state |
 | `src/cache.rs` | `BoundedCache` (per-project, zeroize-on-drop) |
 | `src/audit.rs` | JSONL audit log + async writer + degraded-mode buffer |
-| `src/proto/` | Wire-protocol request/response types |
+| `src/proto/` | Wire-protocol request/response types + smoke-fuzz tests |
 | `src/server.rs` | Daemon harness + admin + project socket loops |
+| `benches/latency.rs` | Criterion benches for NFR-001/002 (warm + cold `get`) |
+| `examples/soak.rs` | SC-002 soak harness (env-configurable; smoke + full SC-002 wired separately in CI) |
+| `examples/killtest.rs` | SC-003 killtest (SIGKILL mid-fetch; asserts plaintext doesn't leak on disk) |
+| `ci/measure_nfr.sh` | Startup-to-ready + idle RSS + binary-size measurement, run by the `nfr` CI job |
+| `schema/remo-broker.v1.json` | Manifest JSON Schema, regenerated from `src/manifest.rs` types behind the `schema-gen` feature |
 | `packaging/` | systemd unit + sysusers + tmpfiles + operator README |
-| `docs/` | Wire protocol + manifest schema specs |
+| `docs/` | Wire protocol, manifest schema, `cargo bloat` snapshot |
 | `specs/001-broker-daemon/` | Canonical feature spec (the source of truth) |
+| `REMO_HANDOFF.md` | Self-contained integration brief for the Remo team |
+| `CONTRIBUTING.md` | Dev setup + 17-scenario manual verification playbook |
 
 ## Development
 
+The everyday loop:
+
 ```bash
 cargo build --all-targets --all-features
-cargo test
+cargo test                                            # unit + E2E tests
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo deny check
 ```
 
-CI runs all of the above on every push and PR, plus `systemd-analyze verify`
-on the unit file. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+Performance + soak (slower, not in the per-PR loop):
+
+```bash
+cargo bench --bench latency               # NFR-001/002 (~15s; --quick for ~3s)
+cargo run --release --example soak        # SC-002 smoke (~5s, env-configurable)
+cargo run --release --example killtest    # SC-003 (5 SIGKILL rounds, ~5s)
+bash ci/measure_nfr.sh                    # NFR-003/004/005 measurements
+```
+
+Manual verification playbook with 17 end-to-end scenarios:
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+CI exercises every check above on every push and PR, split into
+focused jobs: `fmt`, `clippy`, `test`, `cargo audit`, `cargo deny`,
+`packaging` (`systemd-analyze verify`), `nfr` (NFR-003/004/005
+measurement with hard-fail on regression), `benches` (compile-check
+the criterion suite), and `harnesses` (soak + killtest smoke runs).
+The full SC-002 soak (50 sockets × 10 Hz × 1 h) runs nightly via
+[`.github/workflows/soak.yml`](.github/workflows/soak.yml). See
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+### Cargo features
+
+- `schema-gen` (off by default) — pulls in `schemars` so
+  `cargo test --features schema-gen` regenerates and snapshot-tests
+  `schema/remo-broker.v1.json`. The production binary doesn't link
+  `schemars`.
 
 ### Testing conventions
 
