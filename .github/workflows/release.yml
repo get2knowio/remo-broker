@@ -1,0 +1,157 @@
+# Trigger: push of a vX.Y.Z tag.
+# Publishes: stripped x86_64 + aarch64 Linux binaries, .sha256 files, and schema/remo-broker.v1.json.
+# Cut a release: git tag v0.1.0 && git push --tags
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep -D warnings off here; release tags implicitly trust main (which
+  # CI already gated with -D warnings). We don't want a new compiler warning
+  # in a future stable Rust to block a hotfix tag from publishing.
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        # GITHUB_REF is refs/tags/vX.Y.Z; strip the refs/tags/v prefix.
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Building remo-broker v${version} for ${{ matrix.target }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        # cross-rs handles both x86_64 and aarch64 Linux targets via prebuilt
+        # Docker images that include the C toolchains + libudev-dev that
+        # fnox-core -> ctap-hid-fido2 -> hidapi needs at link time. Building
+        # those cross sysroots by hand on bare ubuntu-latest is brittle.
+        # Pinned by version (not SHA) because cross is a cargo-installed binary
+        # and we want a known-good release, not whatever git happens to be at.
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build release binary
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Strip binary
+        # release profile already has strip = "symbols", but run strip again
+        # via the target's binutils to be defensive — covers anything the
+        # cargo profile missed (e.g. note sections from future toolchain bumps).
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/remo-broker"
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            strip "$bin"
+          else
+            sudo apt-get update
+            sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip "$bin"
+          fi
+
+      - name: Stage release artifacts
+        id: stage
+        # Canonical names match what remo's broker_install Ansible role expects:
+        # remo-broker-v<version>-<arch>-unknown-linux-gnu(.sha256)
+        # The .sha256 file uses GNU coreutils `sha256sum` format
+        # (`<hex>  <filename>\n`); remo splits on whitespace and takes the
+        # first token, so this matches both `sha256sum -c` and remo's parser.
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          name="remo-broker-v${version}-${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/remo-broker" "dist/${name}"
+          (cd dist && sha256sum "${name}" > "${name}.sha256")
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+          cat "dist/${name}.sha256"
+
+      - name: Upload artifacts for release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: remo-broker-${{ matrix.arch }}
+          path: dist/${{ steps.stage.outputs.name }}*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release directory
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Flatten the per-arch subdirs created by download-artifact.
+          find artifacts -type f -name 'remo-broker-v*' -exec cp {} release/ \;
+          # Schema artifact published as-is, alongside the binaries.
+          cp schema/remo-broker.v1.json release/
+          ls -la release/
+          # Sanity: 5 files total (2 binaries + 2 .sha256 + 1 schema).
+          test "$(ls release | wc -l)" = "5"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --generate-notes \
+            release/*
+
+      - name: Smoke-test the published x86_64 binary
+        # Downloads the just-published artifact through the public release API
+        # and runs --version on it, proving the upload round-tripped intact
+        # and the binary is executable on a stock ubuntu-latest runner.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          name="remo-broker-v${version}-x86_64-unknown-linux-gnu"
+          mkdir -p smoke
+          gh release download "v${version}" \
+            --pattern "${name}" \
+            --pattern "${name}.sha256" \
+            --dir smoke
+          (cd smoke && sha256sum -c "${name}.sha256")
+          chmod +x "smoke/${name}"
+          "./smoke/${name}" --version
