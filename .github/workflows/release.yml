@@ -46,11 +46,20 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      - name: Install native libudev (x86_64 fast path)
+        # cross's `target == host` heuristic falls back to native cargo for
+        # x86_64-unknown-linux-gnu on an x86_64 runner — no Docker, so the
+        # libudev that fnox-core -> ctap-hid-fido2 -> hidapi needs must
+        # come from the runner itself. aarch64 still goes through cross's
+        # Docker image which ships its own sysroot.
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+
       - name: Install cross
-        # cross-rs handles both x86_64 and aarch64 Linux targets via prebuilt
-        # Docker images that include the C toolchains + libudev-dev that
-        # fnox-core -> ctap-hid-fido2 -> hidapi needs at link time. Building
-        # those cross sysroots by hand on bare ubuntu-latest is brittle.
+        # cross-rs handles aarch64 via prebuilt Docker images that include
+        # the C toolchains + libudev that fnox-core -> hidapi needs.
         # Pinned by version (not SHA) because cross is a cargo-installed binary
         # and we want a known-good release, not whatever git happens to be at.
         run: cargo install cross --version 0.2.5 --locked
