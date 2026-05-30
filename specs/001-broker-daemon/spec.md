@@ -2,7 +2,7 @@
 
 **Feature Branch**: `001-broker-daemon`
 **Created**: 2026-05-24
-**Status**: In Progress
+**Status**: Superseded as of 2026-05-30 by [`002-laptop-push-secrets`](../002-laptop-push-secrets/spec.md). The external-backend / on-instance bootstrap-token model this spec describes was implemented through v0.1.0 but turned out to carry a residual on-disk credential (the bootstrap token itself) that contradicts the supply-chain threat model. The redesign drops `fnox-core`, the backend integration, and the bootstrap-token concept; the laptop now pushes an age-encrypted secrets bundle to the instance and the broker decrypts in memory via systemd-credentials. Kept intact as historical reference.
 **Last Updated**: 2026-05-24 (commit `beead1f`; 130 tests passing, clippy + cargo deny + systemd-analyze + NFR measurements + soak smoke + killtest smoke + bench compile all green)
 **Input**: User description: "A long-lived Rust daemon for Linux instances that holds a per-instance bootstrap token, authenticates upward to a credential backend (1Password / Vault / AWS Secrets Manager / age / OS keychain via the fnox-core library), and serves per-project Unix sockets enforcing per-project allowlists. Built to be the on-instance half of Remo's credential-broker feature (see Remo `005-credential-broker/spec.md`)."
 
